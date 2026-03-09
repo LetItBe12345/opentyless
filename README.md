@@ -40,6 +40,63 @@
 - `tray`：启动 GNOME 托盘菜单
 - `uninstall-service`：卸载用户服务
 
+## CLI Reference
+
+### 录音与转写
+
+- `opentyless-rs daemon`
+  启动后台守护进程；通常配合 `systemd --user` 常驻运行。
+- `opentyless-rs start-record`
+  通知 daemon 开始录音；成功时会更新本地状态并发送“开始录音”通知。
+- `opentyless-rs stop-record`
+  通知 daemon 停止录音，然后执行转写和整理；现在会先提示“已停止录音，正在转写”，完成后再提示“转写完成”。
+- `opentyless-rs toggle-record`
+  在“开始录音”和“停止并转写”之间切换；最适合绑定成桌面快捷键。
+- `opentyless-rs once --seconds 5`
+  不经过 daemon，直接录音指定秒数并处理一次；适合快速测试整条链路。
+
+### 状态与排障
+
+- `opentyless-rs status`
+  输出 daemon 是否在运行、socket 路径，以及当前状态 JSON。
+- `opentyless-rs doctor`
+  检查录音命令、API 环境变量、目录、socket、剪贴板命令和通知开关。
+- `opentyless-rs logs -n 50`
+  查看 `systemd --user` 服务最近日志；`-n` 默认是 `50`。
+- `opentyless-rs copy-last`
+  把最近一次整理后的文本重新复制到剪贴板。
+
+### 服务管理
+
+- `opentyless-rs install-service --enable`
+  安装用户级 systemd 服务；加 `--enable` 时会立刻启用并启动。
+- `opentyless-rs uninstall-service`
+  停止并删除用户服务文件。
+- `opentyless-rs service-status`
+  查看 `opentyless.service` 的 systemd 状态。
+- `opentyless-rs start`
+  等价于 `systemctl --user start opentyless.service`。
+- `opentyless-rs stop`
+  等价于 `systemctl --user stop opentyless.service`。
+- `opentyless-rs restart`
+  等价于 `systemctl --user restart opentyless.service`。
+
+### 桌面集成
+
+- `opentyless-rs install-gnome-shortcut --binding '<Super>space'`
+  通过 `gsettings` 自动创建 GNOME 自定义快捷键，默认绑定 `<Super>space`。
+- `opentyless-rs install-tray-autostart`
+  安装 GNOME 登录自启动项，让托盘随桌面会话一起启动。
+- `opentyless-rs tray`
+  启动系统托盘菜单；支持开始/停止录音、复制最近结果、打开输出目录、显示状态通知。
+
+### 帮助
+
+- `opentyless-rs --help`
+  查看总帮助。
+- `opentyless-rs <command> --help`
+  查看某个子命令的帮助和参数。
+
 ## 项目文件
 
 - `src/main.rs`：主程序
