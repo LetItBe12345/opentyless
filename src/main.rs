@@ -384,6 +384,9 @@ impl Daemon {
     }
 
     fn handle_stream(&mut self, mut stream: UnixStream) -> Result<()> {
+        let timeout = Some(Duration::from_secs(5));
+        stream.set_read_timeout(timeout)?;
+        stream.set_write_timeout(timeout)?;
         let mut input = String::new();
         BufReader::new(stream.try_clone()?).read_line(&mut input)?;
         let request: Request = serde_json::from_str(input.trim())?;
@@ -729,6 +732,9 @@ fn cmd_tray(config: Config) -> Result<()> {
 fn send_request(socket_path: &Path, request: &Request) -> Result<Response> {
     let mut stream = UnixStream::connect(socket_path)
         .with_context(|| format!("无法连接 daemon，请先运行 `opentyless-rs daemon` 或 `install-service --enable`。socket={}", socket_path.display()))?;
+    let timeout = Some(Duration::from_secs(5));
+    stream.set_read_timeout(timeout)?;
+    stream.set_write_timeout(timeout)?;
     stream.write_all(format!("{}\n", serde_json::to_string(request)?).as_bytes())?;
     let mut response = String::new();
     BufReader::new(stream).read_to_string(&mut response)?;
