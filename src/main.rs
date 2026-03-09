@@ -1211,7 +1211,11 @@ fn maybe_copy_to_clipboard(config: &Config, text: &str) -> Result<()> {
     }
     let command = detect_clipboard_command(config)
         .ok_or_else(|| anyhow!("未检测到剪贴板命令，已跳过自动复制"))?;
-    if command.first().map(|s| s.as_str()) == Some("xclip") {
+    if command
+        .first()
+        .map(|program| should_detach_stdin_command(program))
+        .unwrap_or(false)
+    {
         spawn_command_with_stdin_detached(&command[0], &command[1..], text)
     } else {
         run_command_with_stdin(&command[0], &command[1..], text)
@@ -1276,7 +1280,17 @@ fn spawn_command_with_stdin_detached(program: &str, args: &[String], input: &str
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(input.as_bytes())?;
     }
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
     Ok(())
+}
+
+fn should_detach_stdin_command(program: &str) -> bool {
+    Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        == Some("xclip")
 }
 
 fn run_command(program: &str, args: &[&str]) -> Result<()> {
@@ -1517,5 +1531,12 @@ mod tests {
                 None => std::env::remove_var("SOCKET_PATH"),
             }
         }
+    }
+
+    #[test]
+    fn absolute_xclip_path_uses_detached_clipboard_flow() {
+        assert!(should_detach_stdin_command("xclip"));
+        assert!(should_detach_stdin_command("/home/jin/.local/bin/xclip"));
+        assert!(!should_detach_stdin_command("wl-copy"));
     }
 }
