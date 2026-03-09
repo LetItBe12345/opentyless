@@ -372,5 +372,7 @@ setsid -f ~/.local/bin/opentyless-rs tray >/tmp/opentyless-tray.log 2>&1
 
 ## Roadmap
 
+- 提升跨桌面环境的热键稳定性，减少对手工调试 GNOME / Wayland / X11 快捷键的依赖
+- 评估更可靠的热键触发方案，例如桌面扩展、平台专用桥接层或更清晰的快捷键诊断工具
 - 支持多语言界面与文档
 - 支持多种 ASR / LLM API 提供商与可切换配置

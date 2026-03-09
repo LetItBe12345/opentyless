@@ -379,5 +379,7 @@ setsid -f ~/.local/bin/opentyless-rs tray >/tmp/opentyless-tray.log 2>&1
 
 ## Roadmap
 
+- improve cross-desktop hotkey reliability and reduce the need for manual GNOME / Wayland / X11 shortcut debugging
+- evaluate more reliable hotkey trigger paths such as desktop extensions, platform-specific bridge layers, or stronger shortcut diagnostics
 - support multilingual UI and documentation
 - support multiple ASR / LLM API providers with switchable configuration
