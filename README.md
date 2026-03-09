@@ -46,6 +46,17 @@ The desktop environment is responsible for the shortcut. The CLI is responsible 
 
 ## Installation
 
+There are currently three supported installation / distribution paths:
+
+- `git clone` + `./install.sh`
+  This is source installation; the Rust binary is built locally on the user's machine.
+- GitHub Release archive
+  This is prebuilt binary installation; users download an artifact that you built ahead of time.
+- `npm i -g opentyless@latest`
+  This is package-manager distribution; the npm package is a thin installer shell that prefers the bundled prebuilt Rust runtime and falls back to GitHub Releases if needed.
+
+If you are a developer, source installation is the best fit. If you are an end user, GitHub Release or npm is usually more convenient.
+
 ### Option 0: install through npm
 
 If you want a `codex`-style install and upgrade flow, you can distribute OpenTyless through npm:
@@ -164,6 +175,29 @@ Default runtime directories are absolute XDG-style paths:
 - `STATE_DIR`: `~/.local/state/opentyless/state`
 - `OUTPUT_DIR`: `~/.local/share/opentyless/outputs`
 - `SOCKET_PATH`: `~/.local/state/opentyless/run/opentyless.sock`
+
+## Installation Model Notes
+
+### Why keep `install.sh`, GitHub Release, and npm at the same time
+
+- `install.sh`
+  Best for source installs and development; it runs `cargo build --release` locally and therefore depends on the user's Rust toolchain.
+- GitHub Release
+  Best for end users who want a ready-to-use archive without installing Rust locally.
+- npm
+  Best for a modern CLI install / upgrade flow; in practice it still distributes a prebuilt binary, but through an npm-managed entrypoint.
+
+### Why not only use Cargo
+
+- `cargo` is excellent for Rust developers
+- but the mainstream `cargo install` flow still means downloading source and compiling locally
+- for general Linux desktop users, GitHub Release or npm is usually simpler
+
+So the current positioning is:
+
+- development and debugging: `cargo`
+- source install: `git clone` + `./install.sh`
+- end-user distribution: GitHub Release / npm
 
 ## Quick Start
 
@@ -342,3 +376,8 @@ systemctl --user restart opentyless.service
 pkill -f 'opentyless-rs tray' || true
 setsid -f ~/.local/bin/opentyless-rs tray >/tmp/opentyless-tray.log 2>&1
 ```
+
+## Roadmap
+
+- support multilingual UI and documentation
+- support multiple ASR / LLM API providers with switchable configuration

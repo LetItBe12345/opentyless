@@ -46,6 +46,17 @@ OpenTyless 是一个面向桌面工作流的轻量 Rust 语音转写 CLI。它�
 
 ## 安装
 
+当前支持三类安装/分发方式：
+
+- `git clone` + `./install.sh`
+  这是源码安装；会在用户自己的机器上本地编译 Rust 二进制。
+- GitHub Release 压缩包
+  这是预编译二进制安装；用户直接下载你提前构建好的产物再安装。
+- `npm i -g opentyless@latest`
+  这是包管理器分发；npm 包本身是一个很薄的安装壳，实际优先使用随包附带的预编译 Rust 二进制，缺失时再回退到 GitHub Release。
+
+如果你是开发者，推荐使用源码安装；如果你是普通用户，推荐使用 GitHub Release 或 npm。
+
 ### 方案零：通过 npm 安装 Rust 二进制分发包
 
 适合你希望像 `codex` 一样，用 `npm` 统一安装和升级命令行工具。
@@ -164,6 +175,29 @@ DASHSCOPE_API_KEY=your_dashscope_key
 - `STATE_DIR`：`~/.local/state/opentyless/state`
 - `OUTPUT_DIR`：`~/.local/share/opentyless/outputs`
 - `SOCKET_PATH`：`~/.local/state/opentyless/run/opentyless.sock`
+
+## 安装方式说明
+
+### 为什么这里同时保留 `install.sh`、Release 和 npm
+
+- `install.sh`
+  适合源码安装和开发调试；它会在本地执行 `cargo build --release`，因此依赖用户机器具备 Rust 工具链。
+- GitHub Release
+  适合给普通用户提供“开箱即用”的压缩包；不要求用户本地安装 Rust。
+- npm
+  适合提供类似现代 CLI 工具的安装与升级体验；本质上仍然是在分发预编译二进制，只是入口换成了 npm。
+
+### 为什么不只用 Cargo
+
+- `cargo` 非常适合 Rust 开发者
+- 但 `cargo install` 的主流使用方式通常仍然是下载源码并在本地编译
+- 对普通 Linux 桌面用户来说，GitHub Release 或 npm 的体验通常更简单
+
+因此当前项目的定位是：
+
+- 开发和调试：`cargo`
+- 源码安装：`git clone` + `./install.sh`
+- 成品分发：GitHub Release / npm
 
 ## 快速开始
 
@@ -335,3 +369,8 @@ systemctl --user restart opentyless.service
 pkill -f 'opentyless-rs tray' || true
 setsid -f ~/.local/bin/opentyless-rs tray >/tmp/opentyless-tray.log 2>&1
 ```
+
+## Roadmap
+
+- 支持多语言界面与文档
+- 支持多种 ASR / LLM API 提供商与可切换配置
