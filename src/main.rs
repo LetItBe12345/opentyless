@@ -450,40 +450,57 @@ impl Daemon {
             .recorder
             .take()
             .ok_or_else(|| anyhow!("当前没有录音任务"))?;
-        self.config.validate_inference()?;
         let audio_path = recorder.stop()?;
         self.state.recording = false;
         self.state.recorder_pid = None;
-        self.state.last_event = Some("recording_stopped".into());
+        self.state.last_event = Some("transcribing".into());
         self.state.audio_path = Some(audio_path.display().to_string());
-        self.state.save(&self.config.state_path())?;
-        notify_event(&self.config, "OpenTyless", "已停止录音，正在转写").ok();
-
-        let pipeline = Pipeline::new(self.config.clone())?;
-        let (raw_text, polished_text, output_path) = pipeline.run(&audio_path)?;
-        self.state.last_event = Some("pipeline_completed".into());
-        self.state.last_raw_text = Some(raw_text.clone());
-        self.state.last_polished_text = Some(polished_text.clone());
-        self.state.last_output_path = Some(output_path.display().to_string());
         self.state.error = None;
         self.state.save(&self.config.state_path())?;
-        maybe_copy_to_clipboard(&self.config, &polished_text).ok();
-        notify_event(
-            &self.config,
-            "OpenTyless",
-            &format!(
-                "转写完成，已复制到剪贴板\n{}",
-                truncate_text(&polished_text, 80)
-            ),
-        )
-        .ok();
-        Ok(format!(
-            "处理完成\n--- RAW ---\n{}\n\n--- POLISHED ---\n{}\n\n已保存: {}",
-            raw_text,
-            polished_text,
-            output_path.display()
-        ))
+        notify_event(&self.config, "OpenTyless", "已停止录音，正在转写").ok();
+        spawn_pipeline_job(self.config.clone(), audio_path.clone());
+
+        Ok(format!("已停止录音，正在转写: {}", audio_path.display()))
     }
+}
+
+fn spawn_pipeline_job(config: Config, audio_path: PathBuf) {
+    let state_path = config.state_path();
+    thread::spawn(move || {
+        let result: Result<(String, String, PathBuf)> = (|| {
+            config.validate_inference()?;
+            let pipeline = Pipeline::new(config.clone())?;
+            let (raw_text, polished_text, output_path) = pipeline.run(&audio_path)?;
+            maybe_copy_to_clipboard(&config, &polished_text).ok();
+            notify_event(
+                &config,
+                "OpenTyless",
+                &format!(
+                    "转写完成，已复制到剪贴板\n{}",
+                    truncate_text(&polished_text, 80)
+                ),
+            )
+            .ok();
+            Ok((raw_text, polished_text, output_path))
+        })();
+
+        let mut state = State::load(&state_path);
+        match result {
+            Ok((raw_text, polished_text, output_path)) => {
+                state.last_event = Some("pipeline_completed".into());
+                state.last_raw_text = Some(raw_text);
+                state.last_polished_text = Some(polished_text);
+                state.last_output_path = Some(output_path.display().to_string());
+                state.error = None;
+            }
+            Err(error) => {
+                state.last_event = Some("pipeline_failed".into());
+                state.error = Some(error.to_string());
+                notify_event(&config, "OpenTyless 错误", &error.to_string()).ok();
+            }
+        }
+        state.save(&state_path).ok();
+    });
 }
 
 fn main() -> Result<()> {

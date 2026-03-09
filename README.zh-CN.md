@@ -195,7 +195,7 @@ opentyless-rs status
 - `opentyless-rs start-record`
   通知 daemon 开始录音。
 - `opentyless-rs stop-record`
-  通知 daemon 停止录音，然后开始转写和整理；现在会先提示“已停止录音，正在转写”，完成后再提示“转写完成”。
+  通知 daemon 停止录音并立即返回，然后在后台开始转写和整理；现在会先提示“已停止录音，正在转写”，完成后再提示“转写完成”。
 - `opentyless-rs toggle-record`
   在开始录音和停止并转写之间切换；最适合绑快捷键。
 - `opentyless-rs once --seconds 5`

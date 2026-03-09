@@ -195,7 +195,7 @@ opentyless-rs status
 - `opentyless-rs start-record`
   Ask the daemon to begin recording.
 - `opentyless-rs stop-record`
-  Ask the daemon to stop recording, notify that transcription is starting, then run transcription and cleanup.
+  Ask the daemon to stop recording, return immediately, notify that transcription is starting, then run transcription and cleanup in the background.
 - `opentyless-rs toggle-record`
   Toggle between start and stop; this is the best shortcut target.
 - `opentyless-rs once --seconds 5`
