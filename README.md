@@ -13,18 +13,17 @@ It is built around:
 
 For release and publishing workflows, see [Release Guide](docs/RELEASE.md).
 
-## Release Tracks
+## Release Model
 
-This repository currently maintains two release tracks:
+This repository now uses one main feature line and one release flow:
 
-- `master`: the default Wayland-oriented track
-- `x11`: the X11-focused track, including installer defaults tuned for X11 clipboard behavior and desktop startup
-
-Use the track that matches the desktop environment you want to ship.
+- there is a single Rust codepath
+- there is a single primary release artifact
+- Wayland / X11 differences are handled through environment detection and installer defaults
 
 ## Why This Architecture
 
-On modern Linux desktops, especially GNOME Wayland, background apps are not reliable places to listen for global hotkeys.
+On modern Linux desktops, especially GNOME Wayland, background apps are not reliable places to listen for global hotkeys. At the same time, X11 and Wayland still need slightly different clipboard and desktop-integration defaults.
 
 So the project is structured like this:
 
@@ -46,6 +45,25 @@ The desktop environment is responsible for the shortcut. The CLI is responsible 
 - desktop notifications for start, stop, and completion
 
 ## Installation
+
+### Option 0: install through npm
+
+If you want a `codex`-style install and upgrade flow, you can distribute OpenTyless through npm:
+
+```bash
+npm i -g opentyless@latest
+```
+
+Then run:
+
+```bash
+opentyless --help
+opentyless doctor
+```
+
+The npm package is only a thin wrapper. During `postinstall`, it first installs the bundled Rust runtime from the package itself, and only falls back to GitHub Releases if that bundled runtime is missing.
+
+See [`docs/NPM.zh-CN.md`](docs/NPM.zh-CN.md) for the current packaging notes.
 
 ### Option A: one-shot installer
 
@@ -272,17 +290,13 @@ opentyless-rs tray
 
 ## Wayland and X11 Notes
 
-### Wayland
-
-- prefer desktop shortcuts bound to `toggle-record`
-- clipboard defaults should usually point to `wl-copy`
-- direct text injection into the focused input is intentionally not the default behavior
-
-### X11
-
-- the `x11` branch and `x11` release track tune installer defaults around `xclip`
-- if needed, set `RECORDER_CMD` explicitly to the correct ALSA or Pulse device
-- GNOME on X11 can still use the same daemon, service, tray, and shortcut workflow
+- On Wayland, prefer desktop shortcuts bound to `toggle-record` instead of app-level key hooks
+- X11 and Wayland share the same daemon, service, tray, and transcription pipeline
+- Clipboard defaults are now chosen from `XDG_SESSION_TYPE`:
+  - `wayland` prefers `wl-copy`
+  - `x11` prefers `xclip`
+- Direct text injection into the focused input is intentionally not the default behavior
+- If your desktop has multiple clipboard tools installed, set `CLIPBOARD_COMMAND` explicitly
 
 ## Troubleshooting
 

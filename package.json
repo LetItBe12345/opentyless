@@ -1,0 +1,49 @@
+{
+  "name": "opentyless",
+  "version": "0.1.0",
+  "description": "通过 npm 安装的 OpenTyless Rust CLI 分发包",
+  "license": "MIT",
+  "homepage": "https://github.com/LetItBe12345/opentyless",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LetItBe12345/opentyless.git"
+  },
+  "bugs": {
+    "url": "https://github.com/LetItBe12345/opentyless/issues"
+  },
+  "bin": {
+    "opentyless": "bin/opentyless.js",
+    "opentyless-rs": "bin/opentyless.js",
+    "opentyless-hotkey-toggle": "bin/opentyless-hotkey-toggle.js"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "README.md",
+    "README.zh-CN.md"
+  ],
+  "scripts": {
+    "postinstall": "node ./lib/postinstall.js",
+    "smoke": "node ./lib/smoke.js",
+    "prepack": "bash ./scripts/stage-npm-runtime.sh"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "opentyless": {
+    "owner": "LetItBe12345",
+    "repo": "opentyless",
+    "binaryName": "opentyless-rs",
+    "hotkeyName": "opentyless-hotkey-toggle",
+    "assetSuffix": "linux-x86_64",
+    "defaultTagTemplate": "v{version}",
+    "runtimeDir": "lib/runtime",
+    "runtimeSourceDir": "lib/runtime/source"
+  }
+}

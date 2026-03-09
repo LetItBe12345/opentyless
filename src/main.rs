@@ -18,7 +18,9 @@ use serde_json::{Value, json};
 
 #[derive(Parser)]
 #[command(name = "opentyless-rs")]
-#[command(about = "Wayland 友好的 Rust 语音转写 CLI：由系统快捷键触发命令，而非监听全局按键")]
+#[command(
+    about = "面向 Linux 桌面工作流的 Rust 语音转写 CLI：由系统快捷键触发命令，而非监听全局按键"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -580,7 +582,9 @@ fn cmd_once(config: Config, seconds: u64) -> Result<()> {
 }
 
 fn cmd_doctor(config: &Config) -> Result<()> {
+    let session = current_session_type().unwrap_or_else(|| "unknown".into());
     println!("录音命令: {}", detect_recorder_preview(config)?);
+    println!("XDG_SESSION_TYPE: {}", session);
     for name in [
         "DASHSCOPE_BASE_URL",
         "DASHSCOPE_API_KEY",
@@ -616,7 +620,7 @@ fn cmd_doctor(config: &Config) -> Result<()> {
         }
     );
     println!(
-        "提示：Wayland 下请把系统快捷键绑定到 `start-record` / `stop-record` / `toggle-record`"
+        "提示：请把系统快捷键绑定到 `start-record` / `stop-record` / `toggle-record`；推荐直接绑定 `toggle-record`"
     );
     Ok(())
 }
@@ -1236,17 +1240,22 @@ fn detect_clipboard_command(config: &Config) -> Option<Vec<String>> {
             return Some(parts);
         }
     }
-    if command_exists("wl-copy") {
-        return Some(vec!["wl-copy".into()]);
-    }
-    if command_exists("xclip") {
-        return Some(vec![
-            "xclip".into(),
-            "-selection".into(),
-            "clipboard".into(),
-        ]);
+    for candidate in clipboard_command_candidates(current_session_type().as_deref()) {
+        if command_exists(&candidate[0]) {
+            return Some(candidate);
+        }
     }
     None
+}
+
+fn clipboard_command_candidates(session_type: Option<&str>) -> Vec<Vec<String>> {
+    let wl_copy = vec!["wl-copy".into()];
+    let xclip = vec!["xclip".into(), "-selection".into(), "clipboard".into()];
+    match session_type {
+        Some("x11") => vec![xclip, wl_copy],
+        Some("wayland") => vec![wl_copy, xclip],
+        _ => vec![wl_copy, xclip],
+    }
 }
 
 fn detect_clipboard_preview(config: &Config) -> Option<String> {
@@ -1362,6 +1371,10 @@ fn env_optional(name: &str) -> Option<String> {
             Some(trimmed)
         }
     })
+}
+
+fn current_session_type() -> Option<String> {
+    env_optional("XDG_SESSION_TYPE").map(|value| value.trim().to_ascii_lowercase())
 }
 
 fn env_var_or(primary: &str, fallback: &str, default: &str) -> String {
@@ -1538,5 +1551,40 @@ mod tests {
         assert!(should_detach_stdin_command("xclip"));
         assert!(should_detach_stdin_command("/home/jin/.local/bin/xclip"));
         assert!(!should_detach_stdin_command("wl-copy"));
+    }
+
+    #[test]
+    fn clipboard_candidates_prefer_xclip_on_x11() {
+        let candidates = clipboard_command_candidates(Some("x11"));
+        assert_eq!(
+            candidates.first(),
+            Some(&vec![
+                "xclip".to_string(),
+                "-selection".to_string(),
+                "clipboard".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn clipboard_candidates_prefer_wl_copy_on_wayland() {
+        let candidates = clipboard_command_candidates(Some("wayland"));
+        assert_eq!(candidates.first(), Some(&vec!["wl-copy".to_string()]));
+    }
+
+    #[test]
+    fn current_session_type_normalizes_case() {
+        let _guard = env_lock().lock().unwrap();
+        let old = std::env::var_os("XDG_SESSION_TYPE");
+        unsafe {
+            std::env::set_var("XDG_SESSION_TYPE", "WayLand");
+        }
+        assert_eq!(current_session_type().as_deref(), Some("wayland"));
+        unsafe {
+            match old {
+                Some(value) => std::env::set_var("XDG_SESSION_TYPE", value),
+                None => std::env::remove_var("XDG_SESSION_TYPE"),
+            }
+        }
     }
 }

@@ -5,3 +5,5 @@ apikey.md
 /run
 /state
 /dist
+/lib/runtime/
+*.tgz

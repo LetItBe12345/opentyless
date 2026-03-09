@@ -5,6 +5,8 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_BIN_DIR="${HOME}/.local/bin"
 INSTALL_BIN_PATH="${INSTALL_BIN_DIR}/opentyless-rs"
 HOTKEY_WRAPPER_PATH="${INSTALL_BIN_DIR}/opentyless-hotkey-toggle"
+SESSION_TYPE="${XDG_SESSION_TYPE:-unknown}"
+CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-${DESKTOP_SESSION:-unknown}}"
 ENABLE_SERVICE=1
 INSTALL_TRAY=1
 INSTALL_SHORTCUT=0
@@ -126,12 +128,80 @@ ensure_path_hint() {
   esac
 }
 
+read_env_value() {
+  local key="$1"
+  local env_file="${PROJECT_ROOT}/.env"
+  if [[ ! -f "${env_file}" ]]; then
+    return
+  fi
+  sed -n "s/^${key}=//p" "${env_file}" | tail -n 1
+}
+
+normalize_env_value() {
+  local value="${1:-}"
+  value="${value#\"}"
+  value="${value%\"}"
+  printf '%s' "${value}"
+}
+
+upsert_env_value() {
+  local key="$1"
+  local value="$2"
+  local env_file="${PROJECT_ROOT}/.env"
+  local tmp_file
+  tmp_file="$(mktemp)"
+  awk -v key="${key}" -v value="${value}" '
+    BEGIN { replaced = 0 }
+    index($0, key "=") == 1 {
+      print key "=" value
+      replaced = 1
+      next
+    }
+    { print }
+    END {
+      if (!replaced) {
+        print key "=" value
+      }
+    }
+  ' "${env_file}" > "${tmp_file}"
+  mv "${tmp_file}" "${env_file}"
+}
+
 prepare_env_file() {
   if [[ -f "${PROJECT_ROOT}/.env" ]]; then
     return
   fi
   cp "${PROJECT_ROOT}/.env.example" "${PROJECT_ROOT}/.env"
   warn "已生成 .env，请至少填写 DASHSCOPE_API_KEY 后再正式使用。"
+}
+
+configure_session_env_defaults() {
+  local current_clipboard
+  local clipboard_bin=""
+
+  current_clipboard="$(normalize_env_value "$(read_env_value CLIPBOARD_COMMAND)")"
+  if [[ -n "${current_clipboard}" ]]; then
+    return
+  fi
+
+  case "${SESSION_TYPE}" in
+    x11)
+      clipboard_bin="$(command -v xclip || true)"
+      if [[ -n "${clipboard_bin}" ]]; then
+        upsert_env_value "CLIPBOARD_COMMAND" "\"${clipboard_bin} -selection clipboard\""
+        log "检测到 X11，会默认使用 xclip 作为剪贴板命令"
+      else
+        warn "当前是 X11，但未找到 xclip；请安装后再重新运行 install.sh，或手动设置 CLIPBOARD_COMMAND"
+      fi
+      ;;
+    wayland)
+      clipboard_bin="$(command -v wl-copy || true)"
+      if [[ -n "${clipboard_bin}" ]]; then
+        upsert_env_value "CLIPBOARD_COMMAND" "\"${clipboard_bin}\""
+        log "检测到 Wayland，会默认使用 wl-copy 作为剪贴板命令"
+      fi
+      ;;
+  esac
 }
 
 build_release() {
@@ -168,18 +238,46 @@ install_tray() {
   (cd "${PROJECT_ROOT}" && "${INSTALL_BIN_PATH}" install-tray-autostart)
 }
 
+start_tray_now() {
+  if [[ "${INSTALL_TRAY}" -ne 1 ]]; then
+    return
+  fi
+
+  case "${CURRENT_DESKTOP}" in
+    *GNOME*|*gnome*|*ubuntu*|*Ubuntu*) ;;
+    *) return ;;
+  esac
+
+  if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+    return
+  fi
+
+  if pgrep -f "^${INSTALL_BIN_PATH} tray$" >/dev/null 2>&1; then
+    return
+  fi
+
+  if setsid -f "${INSTALL_BIN_PATH}" tray >/tmp/opentyless-tray.log 2>&1; then
+    log "已在当前桌面会话启动托盘"
+  else
+    warn "托盘自启动已安装，但当前会话即时启动失败；可手动执行: ${INSTALL_BIN_PATH} tray"
+  fi
+}
+
 install_shortcut() {
   log "安装 GNOME 快捷键: ${SHORTCUT_BINDING}"
   (cd "${PROJECT_ROOT}" && "${INSTALL_BIN_PATH}" install-gnome-shortcut --binding "${SHORTCUT_BINDING}")
 }
 
 main() {
+  log "检测到桌面会话: session=${SESSION_TYPE}, desktop=${CURRENT_DESKTOP}"
+
   if [[ ${SKIP_DEPS} -eq 0 ]]; then
     install_apt_deps
   fi
 
   ensure_rust
   prepare_env_file
+  configure_session_env_defaults
   build_release
   install_binary
   install_hotkey_wrapper
@@ -192,6 +290,7 @@ main() {
 
   if [[ ${INSTALL_TRAY} -eq 1 ]]; then
     install_tray
+    start_tray_now
   fi
 
   if [[ ${INSTALL_SHORTCUT} -eq 1 ]]; then

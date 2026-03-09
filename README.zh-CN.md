@@ -13,18 +13,17 @@ OpenTyless 是一个面向桌面工作流的轻量 Rust 语音转写 CLI。它�
 
 发布和打包流程见 [发布指南](docs/RELEASE.zh-CN.md)。
 
-## 发布线
+## 发布方式
 
-当前仓库维护两条发布线：
+当前仓库采用一套主功能、一套发布逻辑：
 
-- `master`：默认的 Wayland 取向版本
-- `x11`：面向 X11 的版本，安装脚本默认值和桌面启动行为更偏向 X11/GNOME
-
-需要发哪个版本，就从对应分支构建和发布。
+- 核心 Rust 代码只有一套
+- release 产物只有一条主发布线
+- Wayland / X11 的差异通过运行时环境检测和安装默认值处理
 
 ## 为什么这样设计
 
-在现代 Linux 桌面里，尤其是 GNOME Wayland，后台程序并不适合可靠监听全局快捷键。
+在现代 Linux 桌面里，尤其是 GNOME Wayland，后台程序并不适合可靠监听全局快捷键；而 X11 与 Wayland 在剪贴板、托盘和桌面集成上又存在不同默认值。
 
 因此项目结构是：
 
@@ -46,6 +45,25 @@ OpenTyless 是一个面向桌面工作流的轻量 Rust 语音转写 CLI。它�
 - 开始录音、停止转写、处理完成的桌面通知
 
 ## 安装
+
+### 方案零：通过 npm 安装 Rust 二进制分发包
+
+适合你希望像 `codex` 一样，用 `npm` 统一安装和升级命令行工具。
+
+```bash
+npm i -g opentyless@latest
+```
+
+安装完成后可直接执行：
+
+```bash
+opentyless --help
+opentyless doctor
+```
+
+这个 npm 包本身不重新实现核心逻辑，而是优先携带预编译 Rust 二进制；安装时由 `postinstall` 解包到运行时目录，再由一个很薄的 Node 启动器转发命令。若随包运行时缺失，才回退到 GitHub Release 下载。
+
+更多说明见：[`docs/NPM.zh-CN.md`](docs/NPM.zh-CN.md)。
 
 ### 方案一：一键安装
 
@@ -272,17 +290,13 @@ opentyless-rs tray
 
 ## Wayland 与 X11 说明
 
-### Wayland
-
-- 推荐把桌面快捷键绑定到 `toggle-record`
-- 剪贴板默认通常应当使用 `wl-copy`
+- Wayland 下推荐把桌面快捷键绑定到 `toggle-record`，程序不依赖自己监听全局按键
+- X11 与 Wayland 共用同一套 daemon、service、tray 和转写主流程
+- 当前程序会优先根据 `XDG_SESSION_TYPE` 选择剪贴板默认值：
+  - `wayland` 优先 `wl-copy`
+  - `x11` 优先 `xclip`
 - 当前默认策略不是向焦点输入框直接注入文本，而是复制到剪贴板后由你粘贴
-
-### X11
-
-- `x11` 分支和 `x11` 发布线会把安装默认值更偏向 `xclip`
-- 如有需要，建议显式设置 `RECORDER_CMD`
-- GNOME on X11 仍然适用同样的 daemon、service、tray 和快捷键流程
+- 如果系统同时装了多套剪贴板工具，也可以手动设置 `CLIPBOARD_COMMAND`
 
 ## 常见问题
 

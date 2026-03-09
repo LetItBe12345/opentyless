@@ -158,8 +158,22 @@ fn daemon_cli_flow_works_with_mock_server() {
         "{}",
         String::from_utf8_lossy(&stop.stderr)
     );
+    assert!(String::from_utf8_lossy(&stop.stdout).contains("已停止录音，正在转写"));
 
-    let status = fs::read_to_string(state_dir.join("status.json")).unwrap();
+    let immediate_status = fs::read_to_string(state_dir.join("status.json")).unwrap();
+    assert!(immediate_status.contains("\"last_event\": \"transcribing\""));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        let status = fs::read_to_string(state_dir.join("status.json")).unwrap_or_default();
+        if status.contains("pipeline_completed") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            panic!("daemon flow did not complete in time");
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
     assert!(status.contains("测试语音原文"));
     assert!(status.contains("测试语音整理后"));
 
@@ -167,6 +181,106 @@ fn daemon_cli_flow_works_with_mock_server() {
     assert_eq!(outputs.len(), 1);
     let md = fs::read_to_string(outputs[0].as_ref().unwrap().path()).unwrap();
     assert!(md.contains("测试语音整理后"));
+
+    daemon.kill().ok();
+    daemon.wait().ok();
+    server.join().unwrap();
+}
+
+#[test]
+fn toggle_record_flow_works_with_mock_server() {
+    let temp = tempdir().unwrap();
+    let run_dir = temp.path().join("run");
+    let state_dir = temp.path().join("state");
+    let output_dir = temp.path().join("outputs");
+    fs::create_dir_all(&run_dir).unwrap();
+
+    let fixture = run_dir.join("fixture.wav");
+    fs::write(&fixture, b"RIFF....WAVE").unwrap();
+    let recorder = run_dir.join("fake-recorder.sh");
+    fs::write(
+        &recorder,
+        format!(
+            "#!/usr/bin/env bash\ncp '{}' \"$1\"\nwhile true; do sleep 1; done\n",
+            fixture.display()
+        ),
+    )
+    .unwrap();
+    Command::new("chmod")
+        .args(["+x", recorder.to_str().unwrap()])
+        .status()
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().unwrap();
+            handle_connection(stream);
+        }
+    });
+
+    let exe = std::env::current_dir()
+        .unwrap()
+        .join("target/debug/opentyless-rs");
+    let socket_path = run_dir.join("opentyless.sock");
+    let mut daemon = Command::new(&exe)
+        .arg("daemon")
+        .env("RUN_DIR", &run_dir)
+        .env("STATE_DIR", &state_dir)
+        .env("OUTPUT_DIR", &output_dir)
+        .env("SOCKET_PATH", &socket_path)
+        .env("RECORDER_CMD", recorder.to_str().unwrap())
+        .env("ASR_API_URL", format!("http://{}/chat/completions", addr))
+        .env("FLASH_API_URL", format!("http://{}/chat/completions", addr))
+        .env("ASR_API_KEY", "test")
+        .env("FLASH_API_KEY", "test")
+        .env("AUTO_COPY_TO_CLIPBOARD", "false")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    wait_for(&socket_path);
+
+    let start = Command::new(&exe)
+        .arg("toggle-record")
+        .env("RUN_DIR", &run_dir)
+        .env("STATE_DIR", &state_dir)
+        .env("OUTPUT_DIR", &output_dir)
+        .env("SOCKET_PATH", &socket_path)
+        .output()
+        .unwrap();
+    assert!(start.status.success());
+    assert!(String::from_utf8_lossy(&start.stdout).contains("已开始录音"));
+    wait_for_state_audio(&state_dir.join("status.json"));
+
+    let stop = Command::new(&exe)
+        .arg("toggle-record")
+        .env("RUN_DIR", &run_dir)
+        .env("STATE_DIR", &state_dir)
+        .env("OUTPUT_DIR", &output_dir)
+        .env("SOCKET_PATH", &socket_path)
+        .env("ASR_API_KEY", "test")
+        .env("FLASH_API_KEY", "test")
+        .output()
+        .unwrap();
+    assert!(stop.status.success());
+    assert!(String::from_utf8_lossy(&stop.stdout).contains("已停止录音，正在转写"));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = fs::read_to_string(state_dir.join("status.json")).unwrap_or_default();
+        if status.contains("pipeline_completed") {
+            assert!(status.contains("测试语音原文"));
+            assert!(status.contains("测试语音整理后"));
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("toggle flow did not complete in time");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 
     daemon.kill().ok();
     daemon.wait().ok();
