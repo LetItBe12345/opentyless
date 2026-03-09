@@ -454,6 +454,7 @@ impl Daemon {
         self.state.last_event = Some("recording_stopped".into());
         self.state.audio_path = Some(audio_path.display().to_string());
         self.state.save(&self.config.state_path())?;
+        notify_event(&self.config, "OpenTyless", "已停止录音，正在转写").ok();
 
         let pipeline = Pipeline::new(self.config.clone())?;
         let (raw_text, polished_text, output_path) = pipeline.run(&audio_path)?;
