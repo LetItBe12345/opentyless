@@ -288,6 +288,13 @@ Start the tray manually:
 opentyless-rs tray
 ```
 
+Tray menu behavior:
+
+- Idle: show `开始录音`、`复制最近结果`、`打开输出目录`、`显示状态通知`、`退出托盘`
+- Recording: replace `开始录音` with `停止录音` and add `取消录音`
+- `停止录音` will continue into transcription and clipboard copy
+- `取消录音` will discard the current recording without transcription or clipboard updates
+
 ## Wayland and X11 Notes
 
 - On Wayland, prefer desktop shortcuts bound to `toggle-record` instead of app-level key hooks

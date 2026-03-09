@@ -401,6 +401,7 @@ impl Daemon {
         let result = match action {
             "start-record" => self.start_record(),
             "stop-record" => self.stop_record(),
+            "cancel-record" => self.cancel_record(),
             "toggle-record" => {
                 if self.recorder.is_some() {
                     self.stop_record()
@@ -463,6 +464,23 @@ impl Daemon {
         spawn_pipeline_job(self.config.clone(), audio_path.clone());
 
         Ok(format!("已停止录音，正在转写: {}", audio_path.display()))
+    }
+
+    fn cancel_record(&mut self) -> Result<String> {
+        let recorder = self
+            .recorder
+            .take()
+            .ok_or_else(|| anyhow!("当前没有录音任务"))?;
+        let audio_path = recorder.stop()?;
+        fs::remove_file(&audio_path).ok();
+        self.state.recording = false;
+        self.state.recorder_pid = None;
+        self.state.audio_path = None;
+        self.state.last_event = Some("recording_cancelled".into());
+        self.state.error = None;
+        self.state.save(&self.config.state_path())?;
+        notify_event(&self.config, "OpenTyless", "已取消录音").ok();
+        Ok("已取消录音".into())
     }
 }
 
@@ -883,9 +901,9 @@ impl OpenTylessTray {
         let config = self.config.clone();
         thread::spawn(move || {
             let result: Result<()> = (|| match action {
-                TrayAction::Toggle => cmd_send(&config, "toggle-record"),
                 TrayAction::Start => cmd_send(&config, "start-record"),
                 TrayAction::Stop => cmd_send(&config, "stop-record"),
+                TrayAction::Cancel => cmd_send(&config, "cancel-record"),
                 TrayAction::CopyLast => cmd_copy_last(&config),
                 TrayAction::OpenOutputDir => {
                     ensure_command("gio")?;
@@ -908,9 +926,9 @@ impl OpenTylessTray {
 
 #[derive(Clone, Copy, Debug)]
 enum TrayAction {
-    Toggle,
     Start,
     Stop,
+    Cancel,
     CopyLast,
     OpenOutputDir,
     ShowStatus,
@@ -948,34 +966,42 @@ impl ksni::Tray for OpenTylessTray {
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::*;
-        let toggle_label = if self.recording {
-            "停止录音"
+        let mut items: Vec<ksni::MenuItem<Self>> = Vec::new();
+        if self.recording {
+            items.push(
+                StandardItem {
+                    label: "停止录音".into(),
+                    activate: Box::new(|tray: &mut OpenTylessTray| {
+                        tray.spawn_action(TrayAction::Stop)
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+            items.push(
+                StandardItem {
+                    label: "取消录音".into(),
+                    activate: Box::new(|tray: &mut OpenTylessTray| {
+                        tray.spawn_action(TrayAction::Cancel)
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
         } else {
-            "开始录音"
-        };
-        vec![
-            StandardItem {
-                label: toggle_label.into(),
-                activate: Box::new(|tray: &mut OpenTylessTray| {
-                    tray.spawn_action(TrayAction::Toggle)
-                }),
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
-                label: "单独开始录音".into(),
-                activate: Box::new(|tray: &mut OpenTylessTray| {
-                    tray.spawn_action(TrayAction::Start)
-                }),
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
-                label: "单独停止并转写".into(),
-                activate: Box::new(|tray: &mut OpenTylessTray| tray.spawn_action(TrayAction::Stop)),
-                ..Default::default()
-            }
-            .into(),
+            items.push(
+                StandardItem {
+                    label: "开始录音".into(),
+                    activate: Box::new(|tray: &mut OpenTylessTray| {
+                        tray.spawn_action(TrayAction::Start)
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+
+        items.push(
             StandardItem {
                 label: "复制最近结果".into(),
                 activate: Box::new(|tray: &mut OpenTylessTray| {
@@ -984,6 +1010,8 @@ impl ksni::Tray for OpenTylessTray {
                 ..Default::default()
             }
             .into(),
+        );
+        items.push(
             StandardItem {
                 label: "打开输出目录".into(),
                 activate: Box::new(|tray: &mut OpenTylessTray| {
@@ -992,6 +1020,8 @@ impl ksni::Tray for OpenTylessTray {
                 ..Default::default()
             }
             .into(),
+        );
+        items.push(
             StandardItem {
                 label: "显示状态通知".into(),
                 activate: Box::new(|tray: &mut OpenTylessTray| {
@@ -1000,19 +1030,22 @@ impl ksni::Tray for OpenTylessTray {
                 ..Default::default()
             }
             .into(),
+        );
+        items.push(
             StandardItem {
                 label: "退出托盘".into(),
                 activate: Box::new(|_| std::process::exit(0)),
                 ..Default::default()
             }
             .into(),
-        ]
+        );
+        items
     }
 }
 
 fn build_tray_tooltip(state: &State) -> String {
     if state.recording {
-        return "正在录音；再次按快捷键或点托盘菜单可停止并转写。".into();
+        return "正在录音；可停止并转写，或直接取消本次录音。".into();
     }
     if let Some(text) = &state.last_polished_text {
         return format!("最近结果：{}", truncate_text(text, 60));
