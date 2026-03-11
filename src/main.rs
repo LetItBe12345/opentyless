@@ -491,16 +491,19 @@ fn spawn_pipeline_job(config: Config, audio_path: PathBuf) {
             config.validate_inference()?;
             let pipeline = Pipeline::new(config.clone())?;
             let (raw_text, polished_text, output_path) = pipeline.run(&audio_path)?;
-            maybe_copy_to_clipboard(&config, &polished_text).ok();
-            notify_event(
-                &config,
-                "OpenTyless",
-                &format!(
+            let clipboard_result = maybe_copy_to_clipboard(&config, &polished_text);
+            let notify_body = match clipboard_result {
+                Ok(()) => format!(
                     "转写完成，已复制到剪贴板\n{}",
                     truncate_text(&polished_text, 80)
                 ),
-            )
-            .ok();
+                Err(error) => format!(
+                    "转写完成，但复制到剪贴板失败：{}\n{}",
+                    error,
+                    truncate_text(&polished_text, 80)
+                ),
+            };
+            notify_event(&config, "OpenTyless", &notify_body).ok();
             Ok((raw_text, polished_text, output_path))
         })();
 
@@ -1296,12 +1299,14 @@ fn detect_clipboard_preview(config: &Config) -> Option<String> {
 }
 
 fn run_command_with_stdin(program: &str, args: &[String], input: &str) -> Result<()> {
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    apply_desktop_env(&mut command);
+    let mut child = command.spawn()?;
     if let Some(stdin) = child.stdin.as_mut() {
         stdin.write_all(input.as_bytes())?;
     }
@@ -1313,12 +1318,14 @@ fn run_command_with_stdin(program: &str, args: &[String], input: &str) -> Result
 }
 
 fn spawn_command_with_stdin_detached(program: &str, args: &[String], input: &str) -> Result<()> {
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
+    apply_desktop_env(&mut command);
+    let mut child = command.spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(input.as_bytes())?;
     }
@@ -1336,7 +1343,10 @@ fn should_detach_stdin_command(program: &str) -> bool {
 }
 
 fn run_command(program: &str, args: &[&str]) -> Result<()> {
-    let output = Command::new(program).args(args).output()?;
+    let mut command = Command::new(program);
+    command.args(args);
+    apply_desktop_env(&mut command);
+    let output = command.output()?;
     if !output.status.success() {
         bail!(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
@@ -1344,8 +1354,126 @@ fn run_command(program: &str, args: &[&str]) -> Result<()> {
 }
 
 fn run_command_allow_fail(program: &str, args: &[&str]) -> Result<()> {
-    let _ = Command::new(program).args(args).output()?;
+    let mut command = Command::new(program);
+    command.args(args);
+    apply_desktop_env(&mut command);
+    let _ = command.output()?;
     Ok(())
+}
+
+fn apply_desktop_env(command: &mut Command) {
+    for (key, value) in desktop_env_overrides() {
+        command.env(key, value);
+    }
+}
+
+fn desktop_env_overrides() -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let manager_env = systemd_user_environment();
+    let session_type = current_session_type()
+        .or_else(|| manager_env_value(&manager_env, "XDG_SESSION_TYPE"))
+        .unwrap_or_default();
+    let dbus_bus = env_optional("DBUS_SESSION_BUS_ADDRESS")
+        .or_else(|| manager_env_value(&manager_env, "DBUS_SESSION_BUS_ADDRESS"));
+    let runtime_dir = env_optional("XDG_RUNTIME_DIR")
+        .or_else(|| manager_env_value(&manager_env, "XDG_RUNTIME_DIR"))
+        .or_else(|| {
+            dbus_bus
+                .as_deref()
+                .and_then(derive_runtime_dir_from_dbus_bus)
+        });
+
+    if env_optional("DBUS_SESSION_BUS_ADDRESS").is_none() {
+        if let Some(value) = dbus_bus {
+            pairs.push(("DBUS_SESSION_BUS_ADDRESS".into(), value));
+        }
+    }
+
+    if env_optional("XDG_RUNTIME_DIR").is_none() {
+        if let Some(value) = runtime_dir.clone() {
+            pairs.push(("XDG_RUNTIME_DIR".into(), value));
+        }
+    }
+
+    if env_optional("WAYLAND_DISPLAY").is_none() {
+        if let Some(value) = manager_env_value(&manager_env, "WAYLAND_DISPLAY")
+            .or_else(|| infer_wayland_display(runtime_dir.as_deref()))
+        {
+            pairs.push(("WAYLAND_DISPLAY".into(), value));
+        }
+    }
+
+    if env_optional("DISPLAY").is_none() {
+        if let Some(value) = manager_env_value(&manager_env, "DISPLAY").or_else(infer_x11_display) {
+            pairs.push(("DISPLAY".into(), value));
+        }
+    }
+
+    if env_optional("XDG_SESSION_TYPE").is_none() && !session_type.is_empty() {
+        pairs.push(("XDG_SESSION_TYPE".into(), session_type));
+    }
+
+    pairs
+}
+
+fn systemd_user_environment() -> Vec<(String, String)> {
+    let output = Command::new("systemctl")
+        .args(["--user", "show-environment"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            parse_environment_lines(&String::from_utf8_lossy(&output.stdout))
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn parse_environment_lines(raw: &str) -> Vec<(String, String)> {
+    raw.lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            let key = key.trim();
+            let value = value.trim();
+            if key.is_empty() || value.is_empty() {
+                None
+            } else {
+                Some((key.to_string(), value.to_string()))
+            }
+        })
+        .collect()
+}
+
+fn manager_env_value(env: &[(String, String)], key: &str) -> Option<String> {
+    env.iter()
+        .find(|(candidate, _)| candidate == key)
+        .map(|(_, value)| value.clone())
+}
+
+fn derive_runtime_dir_from_dbus_bus(bus: &str) -> Option<String> {
+    let path = bus.strip_prefix("unix:path=")?;
+    let bus_path = Path::new(path);
+    bus_path.parent().map(|parent| parent.display().to_string())
+}
+
+fn infer_wayland_display(runtime_dir: Option<&str>) -> Option<String> {
+    let runtime_dir = runtime_dir?;
+    for candidate in ["wayland-0", "wayland-1"] {
+        if Path::new(runtime_dir).join(candidate).exists() {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+fn infer_x11_display() -> Option<String> {
+    for candidate in [(":0", "/tmp/.X11-unix/X0"), (":1", "/tmp/.X11-unix/X1")] {
+        if Path::new(candidate.1).exists() {
+            return Some(candidate.0.to_string());
+        }
+    }
+    None
 }
 
 fn print_output(output: std::process::Output) {
@@ -1619,5 +1747,28 @@ mod tests {
                 None => std::env::remove_var("XDG_SESSION_TYPE"),
             }
         }
+    }
+
+    #[test]
+    fn parse_environment_lines_skips_invalid_entries() {
+        let parsed = parse_environment_lines(
+            "DISPLAY=:0\nINVALID\nWAYLAND_DISPLAY=wayland-0\nEMPTY=\n=missing\n",
+        );
+        assert_eq!(
+            parsed,
+            vec![
+                ("DISPLAY".to_string(), ":0".to_string()),
+                ("WAYLAND_DISPLAY".to_string(), "wayland-0".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn derive_runtime_dir_from_dbus_path() {
+        assert_eq!(
+            derive_runtime_dir_from_dbus_bus("unix:path=/run/user/1000/bus"),
+            Some("/run/user/1000".to_string())
+        );
+        assert_eq!(derive_runtime_dir_from_dbus_bus("tcp:host=127.0.0.1"), None);
     }
 }
