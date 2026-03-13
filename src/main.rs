@@ -552,9 +552,7 @@ fn main() -> Result<()> {
 }
 
 fn cmd_daemon(config: Config) -> Result<()> {
-    if process_running(&config.pid_path()) {
-        bail!("daemon 已在运行中");
-    }
+    ensure_daemon_runtime_ready(&config)?;
     Daemon::new(config)?.run()
 }
 
@@ -576,11 +574,7 @@ fn cmd_send(config: &Config, action: &str) -> Result<()> {
 fn cmd_status(config: &Config) -> Result<()> {
     println!(
         "daemon_running: {}",
-        if process_running(&config.pid_path()) {
-            "yes"
-        } else {
-            "no"
-        }
+        if daemon_running(config) { "yes" } else { "no" }
     );
     println!("socket_path: {}", config.socket_path.display());
     let state = State::load(&config.state_path());
@@ -1507,12 +1501,80 @@ fn command_exists(command: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn process_running(pid_path: &Path) -> bool {
+    process_running_with_name(pid_path, None)
+}
+
+fn process_running_with_name(pid_path: &Path, expected_name: Option<&str>) -> bool {
     fs::read_to_string(pid_path)
         .ok()
         .and_then(|content| content.trim().parse::<u32>().ok())
-        .map(|pid| PathBuf::from(format!("/proc/{pid}")).exists())
+        .map(|pid| pid_matches_expected_process(pid, expected_name))
         .unwrap_or(false)
+}
+
+fn pid_matches_expected_process(pid: u32, expected_name: Option<&str>) -> bool {
+    let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+    if !proc_dir.exists() {
+        return false;
+    }
+
+    let Some(expected_name) = expected_name else {
+        return true;
+    };
+
+    let exe_matches = fs::read_link(proc_dir.join("exe"))
+        .ok()
+        .and_then(|path| path.file_name().map(|name| name.to_os_string()))
+        .map(|name| name == expected_name)
+        .unwrap_or(false);
+
+    let cmdline_matches = fs::read(proc_dir.join("cmdline"))
+        .ok()
+        .map(|bytes| {
+            bytes
+                .split(|byte| *byte == 0)
+                .filter_map(|part| std::str::from_utf8(part).ok())
+                .any(|part| part.contains(expected_name))
+        })
+        .unwrap_or(false);
+
+    exe_matches || cmdline_matches
+}
+
+fn daemon_running(config: &Config) -> bool {
+    let expected_name = env!("CARGO_PKG_NAME");
+    if process_running_with_name(&config.pid_path(), Some(expected_name)) {
+        return true;
+    }
+
+    socket_accepting_connections(&config.socket_path)
+}
+
+fn ensure_daemon_runtime_ready(config: &Config) -> Result<()> {
+    let expected_name = env!("CARGO_PKG_NAME");
+    if process_running_with_name(&config.pid_path(), Some(expected_name)) {
+        bail!("daemon 已在运行中");
+    }
+
+    if config.pid_path().exists() {
+        fs::remove_file(config.pid_path()).ok();
+    }
+
+    if config.socket_path.exists() {
+        if socket_accepting_connections(&config.socket_path) {
+            bail!("daemon 已在运行中");
+        }
+        fs::remove_file(&config.socket_path)
+            .with_context(|| format!("清理残留 socket 失败: {}", config.socket_path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn socket_accepting_connections(socket_path: &Path) -> bool {
+    UnixStream::connect(socket_path).is_ok()
 }
 
 fn env_var(name: &str, default: &str) -> String {
@@ -1573,6 +1635,8 @@ fn default_data_home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::net::UnixListener;
+    use std::process::Command;
     use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
 
@@ -1770,5 +1834,70 @@ mod tests {
             Some("/run/user/1000".to_string())
         );
         assert_eq!(derive_runtime_dir_from_dbus_bus("tcp:host=127.0.0.1"), None);
+    }
+
+    #[test]
+    fn process_running_requires_matching_process_name() {
+        let temp = tempdir().unwrap();
+        let pid_path = temp.path().join("opentyless.pid");
+        let child = Command::new("sleep").arg("5").spawn().unwrap();
+        fs::write(&pid_path, child.id().to_string()).unwrap();
+
+        assert!(process_running(&pid_path));
+        assert!(!process_running_with_name(&pid_path, Some("opentyless-rs")));
+
+        let mut child = child;
+        child.kill().ok();
+        child.wait().ok();
+    }
+
+    #[test]
+    fn ensure_daemon_runtime_ready_cleans_stale_pid_and_socket() {
+        let temp = tempdir().unwrap();
+        let run_dir = temp.path().join("run");
+        let state_dir = temp.path().join("state");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::create_dir_all(&state_dir).unwrap();
+
+        let pid_path = run_dir.join("opentyless.pid");
+        let socket_path = run_dir.join("opentyless.sock");
+        let child = Command::new("sleep").arg("5").spawn().unwrap();
+        fs::write(&pid_path, child.id().to_string()).unwrap();
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        drop(listener);
+
+        let mut config = sample_config();
+        config.run_dir = run_dir.clone();
+        config.state_dir = state_dir;
+        config.socket_path = socket_path.clone();
+
+        ensure_daemon_runtime_ready(&config).unwrap();
+
+        assert!(!pid_path.exists());
+        assert!(!socket_path.exists());
+
+        let mut child = child;
+        child.kill().ok();
+        child.wait().ok();
+    }
+
+    #[test]
+    fn ensure_daemon_runtime_ready_rejects_live_socket_without_pid() {
+        let temp = tempdir().unwrap();
+        let run_dir = temp.path().join("run");
+        let state_dir = temp.path().join("state");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::create_dir_all(&state_dir).unwrap();
+
+        let socket_path = run_dir.join("opentyless.sock");
+        let _listener = UnixListener::bind(&socket_path).unwrap();
+
+        let mut config = sample_config();
+        config.run_dir = run_dir;
+        config.state_dir = state_dir;
+        config.socket_path = socket_path;
+
+        let error = ensure_daemon_runtime_ready(&config).unwrap_err();
+        assert!(error.to_string().contains("daemon 已在运行中"));
     }
 }
