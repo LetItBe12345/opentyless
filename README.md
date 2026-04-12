@@ -164,6 +164,8 @@ Defaults already assume DashScope compatible mode:
 Useful optional variables:
 
 - `RECORDER_CMD`: override the recording command
+- `FLASH_PROMPT`: override the cleanup system prompt; requests already wrap transcripts in `<raw_transcript>...</raw_transcript>`, force JSON mode, and use low-temperature decoding
+- `FLASH_EXTRA_BODY_JSON`: merge extra JSON into the cleanup request body; defaults already include `response_format={"type":"json_object"}`, `temperature=0.1`, and `seed=7`
 - `AUTO_COPY_TO_CLIPBOARD`: enable or disable automatic copy
 - `CLIPBOARD_COMMAND`: force `xclip`, `wl-copy`, or a custom command
 - `ENABLE_NOTIFICATIONS`: enable or disable desktop notifications

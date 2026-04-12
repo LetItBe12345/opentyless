@@ -35,10 +35,17 @@ fn handle_connection(mut stream: TcpStream) {
     let mut body = vec![0u8; content_length];
     reader.read_exact(&mut body).unwrap();
     let body_str = String::from_utf8_lossy(&body);
+    let request_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let response_body = if body_str.contains("qwen3-asr-flash") {
         r#"{"choices":[{"message":{"content":[{"type":"text","text":"测试语音原文"}]}}]}"#
     } else {
-        r#"{"choices":[{"message":{"content":"测试语音整理后"}}]}"#
+        assert_eq!(request_body["response_format"]["type"], "json_object");
+        assert_eq!(request_body["temperature"], 0.1);
+        assert_eq!(request_body["seed"], 7);
+        let user_content = request_body["messages"][1]["content"].as_str().unwrap();
+        assert!(user_content.contains("<raw_transcript>"));
+        assert!(user_content.contains("测试语音原文"));
+        r#"{"choices":[{"message":{"content":"{\"text\":\"测试语音整理后\"}"}}]}"#
     };
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
