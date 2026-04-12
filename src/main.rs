@@ -298,7 +298,9 @@ impl QwenClient {
             .send()?
             .error_for_status()?
             .json()?;
-        extract_text(&payload).ok_or_else(|| anyhow!("Flash 返回中未找到文本: {payload}"))
+        extract_text(&payload)
+            .map(|text| normalize_cleanup_text(&text))
+            .ok_or_else(|| anyhow!("Flash 返回中未找到文本: {payload}"))
     }
 }
 
@@ -1217,6 +1219,38 @@ fn extract_text(value: &Value) -> Option<String> {
     }
 }
 
+fn normalize_cleanup_text(text: &str) -> String {
+    let mut current = text.trim().to_string();
+    for _ in 0..4 {
+        let stripped = strip_code_fence(&current);
+        let stripped = stripped.trim();
+        let next = serde_json::from_str::<Value>(stripped)
+            .ok()
+            .and_then(|value| extract_text(&value))
+            .unwrap_or_else(|| stripped.to_string());
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    current.trim().to_string()
+}
+
+fn strip_code_fence(text: &str) -> String {
+    let trimmed = text.trim();
+    let Some(rest) = trimmed.strip_prefix("```") else {
+        return trimmed.to_string();
+    };
+    let Some(body_start) = rest.find('\n') else {
+        return trimmed.to_string();
+    };
+    let body = &rest[body_start + 1..];
+    let Some(body) = body.strip_suffix("```") else {
+        return trimmed.to_string();
+    };
+    body.trim().to_string()
+}
+
 fn polished_output_looks_like_answer(raw_text: &str, polished_text: &str) -> bool {
     let raw = raw_text.trim();
     let polished = polished_text.trim();
@@ -1910,6 +1944,22 @@ mod tests {
             }]
         });
         assert_eq!(extract_text(&payload).as_deref(), Some("整理后的文本"));
+    }
+
+    #[test]
+    fn normalize_cleanup_text_unwraps_json_object_string() {
+        assert_eq!(
+            normalize_cleanup_text(r#"{"text":"今天天气是什么？"}"#),
+            "今天天气是什么？"
+        );
+    }
+
+    #[test]
+    fn normalize_cleanup_text_unwraps_json_code_fence() {
+        assert_eq!(
+            normalize_cleanup_text("```json\n{\"text\":\"今天天气是什么？\"}\n```"),
+            "今天天气是什么？"
+        );
     }
 
     #[test]
