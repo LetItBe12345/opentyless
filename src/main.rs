@@ -38,12 +38,19 @@ enum Commands {
     InstallService(InstallServiceArgs),
     InstallGnomeShortcut(GnomeShortcutArgs),
     InstallTrayAutostart,
+    InstallTrayService(InstallServiceArgs),
     UninstallService,
+    UninstallTrayService,
     ServiceStatus,
+    TrayServiceStatus,
     Start,
     Stop,
     Restart,
+    StartTray,
+    StopTray,
+    RestartTray,
     Logs(LogsArgs),
+    TrayLogs(LogsArgs),
     CopyLast,
     Tray,
 }
@@ -559,12 +566,19 @@ fn main() -> Result<()> {
         Commands::InstallService(args) => cmd_install_service(&config, args.enable),
         Commands::InstallGnomeShortcut(args) => cmd_install_gnome_shortcut(args),
         Commands::InstallTrayAutostart => cmd_install_tray_autostart(),
+        Commands::InstallTrayService(args) => cmd_install_tray_service(&config, args.enable),
         Commands::UninstallService => cmd_uninstall_service(),
-        Commands::ServiceStatus => cmd_service_status(),
+        Commands::UninstallTrayService => cmd_uninstall_tray_service(),
+        Commands::ServiceStatus => cmd_service_status("opentyless.service"),
+        Commands::TrayServiceStatus => cmd_service_status("opentyless-tray.service"),
         Commands::Start => cmd_systemctl(&["start", "opentyless.service"]),
         Commands::Stop => cmd_systemctl(&["stop", "opentyless.service"]),
         Commands::Restart => cmd_systemctl(&["restart", "opentyless.service"]),
-        Commands::Logs(args) => cmd_logs(args.lines),
+        Commands::StartTray => cmd_systemctl(&["start", "opentyless-tray.service"]),
+        Commands::StopTray => cmd_systemctl(&["stop", "opentyless-tray.service"]),
+        Commands::RestartTray => cmd_systemctl(&["restart", "opentyless-tray.service"]),
+        Commands::Logs(args) => cmd_logs("opentyless.service", args.lines),
+        Commands::TrayLogs(args) => cmd_logs("opentyless-tray.service", args.lines),
         Commands::CopyLast => cmd_copy_last(&config),
         Commands::Tray => cmd_tray(config),
     }
@@ -745,10 +759,45 @@ fn cmd_install_tray_autostart() -> Result<()> {
     Ok(())
 }
 
-fn cmd_service_status() -> Result<()> {
+fn cmd_install_tray_service(config: &Config, enable: bool) -> Result<()> {
+    ensure_systemctl()?;
+    let service_dir = PathBuf::from(std::env::var("HOME")?).join(".config/systemd/user");
+    fs::create_dir_all(&service_dir)?;
+    let service_path = service_dir.join("opentyless-tray.service");
+    fs::write(&service_path, render_tray_service(config))?;
+    run_command("systemctl", &["--user", "daemon-reload"])?;
+    if enable {
+        run_command(
+            "systemctl",
+            &["--user", "enable", "--now", "opentyless-tray.service"],
+        )?;
+        println!("已安装并启用: {}", service_path.display());
+    } else {
+        println!("已安装服务文件: {}", service_path.display());
+    }
+    Ok(())
+}
+
+fn cmd_uninstall_tray_service() -> Result<()> {
+    ensure_systemctl()?;
+    let service_path =
+        PathBuf::from(std::env::var("HOME")?).join(".config/systemd/user/opentyless-tray.service");
+    run_command_allow_fail(
+        "systemctl",
+        &["--user", "disable", "--now", "opentyless-tray.service"],
+    )?;
+    if service_path.exists() {
+        fs::remove_file(&service_path)?;
+    }
+    run_command("systemctl", &["--user", "daemon-reload"])?;
+    println!("已卸载托盘服务文件");
+    Ok(())
+}
+
+fn cmd_service_status(unit: &str) -> Result<()> {
     ensure_systemctl()?;
     let output = Command::new("systemctl")
-        .args(["--user", "status", "opentyless.service"])
+        .args(["--user", "status", unit])
         .output()?;
     print_output(output);
     Ok(())
@@ -761,12 +810,12 @@ fn cmd_systemctl(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_logs(lines: usize) -> Result<()> {
+fn cmd_logs(unit: &str, lines: usize) -> Result<()> {
     let output = Command::new("journalctl")
         .args([
             "--user",
             "-u",
-            "opentyless.service",
+            unit,
             "-n",
             &lines.to_string(),
             "--no-pager",
@@ -1348,6 +1397,33 @@ fn render_service(_config: &Config) -> String {
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     format!(
         "[Unit]\nDescription=OpenTyless Rust daemon\nAfter=default.target\n\n[Service]\nType=simple\nWorkingDirectory={}\nEnvironmentFile={}\nExecStart={} daemon\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n",
+        root.display(),
+        root.join(".env").display(),
+        exe.display(),
+    )
+}
+
+fn render_tray_service(_config: &Config) -> String {
+    let exe = preferred_binary_path();
+    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    format!(
+        "[Unit]\n\
+         Description=OpenTyless system tray indicator\n\
+         After=graphical-session.target\n\
+         PartOf=graphical-session.target\n\
+         Requires=opentyless.service\n\
+         After=opentyless.service\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         WorkingDirectory={}\n\
+         EnvironmentFile={}\n\
+         ExecStart={} tray\n\
+         Restart=always\n\
+         RestartSec=3\n\
+         \n\
+         [Install]\n\
+         WantedBy=graphical-session.target\n",
         root.display(),
         root.join(".env").display(),
         exe.display(),
@@ -2187,6 +2263,51 @@ mod tests {
         let mut child = child;
         child.kill().ok();
         child.wait().ok();
+    }
+
+    #[test]
+    fn render_tray_service_has_restart_always_and_depends_on_daemon() {
+        let config = sample_config();
+        let unit = render_tray_service(&config);
+        assert!(unit.contains("Restart=always"), "should have Restart=always");
+        assert!(
+            unit.contains("Requires=opentyless.service"),
+            "should depend on daemon service"
+        );
+        assert!(
+            unit.contains("After=opentyless.service"),
+            "should start after daemon service"
+        );
+        assert!(
+            unit.contains("tray"),
+            "ExecStart should invoke the tray subcommand"
+        );
+        assert!(
+            unit.contains("graphical-session.target"),
+            "should be part of graphical session"
+        );
+    }
+
+    #[test]
+    fn render_tray_service_contains_environment_file() {
+        let config = sample_config();
+        let unit = render_tray_service(&config);
+        assert!(
+            unit.contains("EnvironmentFile="),
+            "should reference an EnvironmentFile"
+        );
+        assert!(
+            unit.contains(".env"),
+            "EnvironmentFile should point to .env"
+        );
+    }
+
+    #[test]
+    fn render_service_has_restart_always() {
+        let config = sample_config();
+        let unit = render_service(&config);
+        assert!(unit.contains("Restart=always"));
+        assert!(unit.contains("daemon"));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -292,4 +292,74 @@ fn toggle_record_flow_works_with_mock_server() {
     daemon.kill().ok();
     daemon.wait().ok();
     server.join().unwrap();
+}
+
+fn debug_exe() -> PathBuf {
+    std::env::current_dir()
+        .unwrap()
+        .join("target/debug/opentyless-rs")
+}
+
+#[test]
+fn install_tray_service_writes_unit_file() {
+    let temp = tempdir().unwrap();
+    let fake_home = temp.path().join("home");
+    fs::create_dir_all(&fake_home).unwrap();
+    let env_file = temp.path().join(".env");
+    fs::write(&env_file, "ASR_API_KEY=test\n").unwrap();
+
+    let output = Command::new(debug_exe())
+        .arg("install-tray-service")
+        .env("HOME", &fake_home)
+        .env("ASR_API_KEY", "test")
+        .env("FLASH_API_KEY", "test")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() && stderr.contains("systemctl") {
+        eprintln!("skipping: systemctl not usable in test env");
+        return;
+    }
+
+    let unit_path = fake_home.join(".config/systemd/user/opentyless-tray.service");
+    assert!(unit_path.exists(), "unit file should be created");
+    let content = fs::read_to_string(&unit_path).unwrap();
+    assert!(content.contains("Restart=always"));
+    assert!(content.contains("opentyless.service"));
+    assert!(content.contains("tray"));
+    assert!(content.contains("graphical-session.target"));
+}
+
+#[test]
+fn uninstall_tray_service_removes_unit_file() {
+    let temp = tempdir().unwrap();
+    let fake_home = temp.path().join("home");
+    let unit_dir = fake_home.join(".config/systemd/user");
+    fs::create_dir_all(&unit_dir).unwrap();
+    let unit_path = unit_dir.join("opentyless-tray.service");
+    fs::write(&unit_path, "[Unit]\nDescription=test\n").unwrap();
+
+    let output = Command::new(debug_exe())
+        .arg("uninstall-tray-service")
+        .env("HOME", &fake_home)
+        .env("ASR_API_KEY", "test")
+        .env("FLASH_API_KEY", "test")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() && stderr.contains("systemctl") {
+        eprintln!("skipping: systemctl not usable in test env");
+        return;
+    }
+
+    assert!(
+        !unit_path.exists(),
+        "unit file should be removed after uninstall"
+    );
 }
