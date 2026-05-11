@@ -1651,43 +1651,40 @@ fn desktop_env_overrides() -> Vec<(String, String)> {
     let session_type = current_session_type()
         .or_else(|| manager_env_value(&manager_env, "XDG_SESSION_TYPE"))
         .unwrap_or_default();
-    let dbus_bus = env_optional("DBUS_SESSION_BUS_ADDRESS")
-        .or_else(|| manager_env_value(&manager_env, "DBUS_SESSION_BUS_ADDRESS"));
-    let runtime_dir = env_optional("XDG_RUNTIME_DIR")
-        .or_else(|| manager_env_value(&manager_env, "XDG_RUNTIME_DIR"))
+    let dbus_bus = manager_env_value(&manager_env, "DBUS_SESSION_BUS_ADDRESS")
+        .or_else(|| env_optional("DBUS_SESSION_BUS_ADDRESS"));
+    let runtime_dir = manager_env_value(&manager_env, "XDG_RUNTIME_DIR")
+        .or_else(|| env_optional("XDG_RUNTIME_DIR"))
         .or_else(|| {
             dbus_bus
                 .as_deref()
                 .and_then(derive_runtime_dir_from_dbus_bus)
         });
+    let xauthority = manager_env_value(&manager_env, "XAUTHORITY").or_else(|| env_optional("XAUTHORITY"));
 
-    if env_optional("DBUS_SESSION_BUS_ADDRESS").is_none() {
-        if let Some(value) = dbus_bus {
-            pairs.push(("DBUS_SESSION_BUS_ADDRESS".into(), value));
-        }
+    if let Some(value) = dbus_bus {
+        pairs.push(("DBUS_SESSION_BUS_ADDRESS".into(), value));
     }
 
-    if env_optional("XDG_RUNTIME_DIR").is_none() {
-        if let Some(value) = runtime_dir.clone() {
-            pairs.push(("XDG_RUNTIME_DIR".into(), value));
-        }
+    if let Some(value) = runtime_dir.clone() {
+        pairs.push(("XDG_RUNTIME_DIR".into(), value));
     }
 
-    if env_optional("WAYLAND_DISPLAY").is_none() {
-        if let Some(value) = manager_env_value(&manager_env, "WAYLAND_DISPLAY")
-            .or_else(|| infer_wayland_display(runtime_dir.as_deref()))
-        {
-            pairs.push(("WAYLAND_DISPLAY".into(), value));
-        }
+    if let Some(value) = manager_env_value(&manager_env, "WAYLAND_DISPLAY")
+        .or_else(|| infer_wayland_display(runtime_dir.as_deref()))
+    {
+        pairs.push(("WAYLAND_DISPLAY".into(), value));
     }
 
-    if env_optional("DISPLAY").is_none() {
-        if let Some(value) = manager_env_value(&manager_env, "DISPLAY").or_else(infer_x11_display) {
-            pairs.push(("DISPLAY".into(), value));
-        }
+    if let Some(value) = manager_env_value(&manager_env, "DISPLAY").or_else(infer_x11_display) {
+        pairs.push(("DISPLAY".into(), value));
     }
 
-    if env_optional("XDG_SESSION_TYPE").is_none() && !session_type.is_empty() {
+    if let Some(value) = xauthority {
+        pairs.push(("XAUTHORITY".into(), value));
+    }
+
+    if !session_type.is_empty() {
         pairs.push(("XDG_SESSION_TYPE".into(), session_type));
     }
 
