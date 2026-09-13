@@ -10,7 +10,9 @@ CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-${DESKTOP_SESSION:-unknown}}"
 ENABLE_SERVICE=1
 INSTALL_TRAY=1
 INSTALL_SHORTCUT=0
-SHORTCUT_BINDING="F8"
+UNINSTALL_SHORTCUT=0
+SHORTCUT_BINDING=""
+FORCE_SHORTCUT=0
 SKIP_DEPS=0
 
 log() {
@@ -36,7 +38,9 @@ usage() {
   --no-service          不安装 systemd --user 服务
   --no-tray             不安装 GNOME 托盘自启动
   --install-shortcut    安装 GNOME 快捷键
-  --binding <keys>      GNOME 快捷键绑定，默认 F8
+  --uninstall-shortcut  删除由 OpenTyless 管理的桌面快捷键后退出
+  --binding <keys>      快捷键绑定；Omarchy 默认 SUPER + V，GNOME 默认 <Super>v
+  --force               即使快捷键已被占用也覆盖（仅 Omarchy/Hyprland）
   -h, --help            显示帮助
 
 说明:
@@ -65,6 +69,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --install-shortcut)
       INSTALL_SHORTCUT=1
+      shift
+      ;;
+    --uninstall-shortcut)
+      UNINSTALL_SHORTCUT=1
+      shift
+      ;;
+    --force)
+      FORCE_SHORTCUT=1
       shift
       ;;
     --binding)
@@ -96,6 +108,7 @@ install_apt_deps() {
   )
 
   if ! command -v apt-get >/dev/null 2>&1; then
+    command -v pacman >/dev/null 2>&1 && return
     warn "未检测到 apt-get，跳过系统依赖自动安装。请自行确保已安装: ${packages[*]}"
     return
   fi
@@ -103,6 +116,23 @@ install_apt_deps() {
   log "安装系统依赖: ${packages[*]}"
   sudo apt-get update
   sudo apt-get install -y "${packages[@]}"
+}
+
+install_arch_deps() {
+  command -v pacman >/dev/null 2>&1 || return
+
+  local packages=(base-devel pkgconf ffmpeg wl-clipboard alsa-lib dbus libayatana-appindicator)
+  local missing=()
+  local package
+  for package in "${packages[@]}"; do
+    pacman -Q "${package}" >/dev/null 2>&1 || missing+=("${package}")
+  done
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    return
+  fi
+  command -v omarchy >/dev/null 2>&1 || die "缺少 Arch 依赖: ${missing[*]}；未找到 omarchy 命令"
+  log "通过 omarchy 安装缺失依赖: ${missing[*]}"
+  omarchy pkg add "${missing[@]}"
 }
 
 ensure_rust() {
@@ -173,6 +203,12 @@ prepare_env_file() {
   fi
   cp "${PROJECT_ROOT}/.env.example" "${PROJECT_ROOT}/.env"
   warn "已生成 .env，请至少填写 DASHSCOPE_API_KEY 后再正式使用。"
+  chmod 600 "${PROJECT_ROOT}/.env"
+}
+
+secure_env_file() {
+  [[ -f "${PROJECT_ROOT}/.env" ]] || return
+  chmod 600 "${PROJECT_ROOT}/.env"
 }
 
 configure_session_env_defaults() {
@@ -211,15 +247,21 @@ build_release() {
 
 install_binary() {
   mkdir -p "${INSTALL_BIN_DIR}"
-  cp "${PROJECT_ROOT}/target/release/opentyless-rs" "${INSTALL_BIN_PATH}"
-  chmod +x "${INSTALL_BIN_PATH}"
+  local staged_binary
+  staged_binary="$(mktemp "${INSTALL_BIN_DIR}/.opentyless-rs.XXXXXX")"
+  cp "${PROJECT_ROOT}/target/release/opentyless-rs" "${staged_binary}"
+  chmod +x "${staged_binary}"
+  mv -f "${staged_binary}" "${INSTALL_BIN_PATH}"
   log "已安装二进制: ${INSTALL_BIN_PATH}"
 }
 
 install_hotkey_wrapper() {
   mkdir -p "${INSTALL_BIN_DIR}"
-  cp "${PROJECT_ROOT}/scripts/hotkey-toggle.sh" "${HOTKEY_WRAPPER_PATH}"
-  chmod +x "${HOTKEY_WRAPPER_PATH}"
+  local staged_wrapper
+  staged_wrapper="$(mktemp "${INSTALL_BIN_DIR}/.opentyless-hotkey-toggle.XXXXXX")"
+  cp "${PROJECT_ROOT}/scripts/hotkey-toggle.sh" "${staged_wrapper}"
+  chmod +x "${staged_wrapper}"
+  mv -f "${staged_wrapper}" "${HOTKEY_WRAPPER_PATH}"
   log "已安装热键包装脚本: ${HOTKEY_WRAPPER_PATH}"
 }
 
@@ -234,8 +276,16 @@ install_service() {
 }
 
 install_tray() {
-  log "安装 GNOME 托盘自启动"
-  (cd "${PROJECT_ROOT}" && "${INSTALL_BIN_PATH}" install-tray-autostart)
+  case "${CURRENT_DESKTOP}" in
+    *Hyprland*|*hyprland*)
+      log "安装并启用 Hyprland/Omarchy 托盘用户服务"
+      (cd "${PROJECT_ROOT}" && "${INSTALL_BIN_PATH}" install-tray-service --enable)
+      ;;
+    *)
+      log "安装桌面托盘自启动"
+      (cd "${PROJECT_ROOT}" && "${INSTALL_BIN_PATH}" install-tray-autostart)
+      ;;
+  esac
 }
 
 start_tray_now() {
@@ -264,19 +314,106 @@ start_tray_now() {
 }
 
 install_shortcut() {
-  log "安装 GNOME 快捷键: ${SHORTCUT_BINDING}"
-  (cd "${PROJECT_ROOT}" && "${INSTALL_BIN_PATH}" install-gnome-shortcut --binding "${SHORTCUT_BINDING}")
+  case "${CURRENT_DESKTOP}" in
+    *Hyprland*|*hyprland*) install_hyprland_shortcut ;;
+    *)
+      log "安装 GNOME 快捷键: ${SHORTCUT_BINDING}"
+      (cd "${PROJECT_ROOT}" && "${INSTALL_BIN_PATH}" install-gnome-shortcut --binding "${SHORTCUT_BINDING}")
+      ;;
+  esac
+}
+
+hyprland_bindings_path() {
+  printf '%s' "${HOME}/.config/hypr/bindings.lua"
+}
+
+remove_managed_hyprland_block() {
+  local bindings_path="$1"
+  local tmp_file
+  tmp_file="$(mktemp)"
+  awk '
+    /^-- BEGIN OPENTYLESS MANAGED SHORTCUT$/ { managed = 1; next }
+    /^-- END OPENTYLESS MANAGED SHORTCUT$/ { managed = 0; next }
+    !managed { print }
+  ' "${bindings_path}" > "${tmp_file}"
+  mv "${tmp_file}" "${bindings_path}"
+}
+
+backup_hyprland_bindings() {
+  local bindings_path="$1"
+  local backup_path="${bindings_path}.opentyless.bak.$(date +%Y%m%d%H%M%S)"
+  cp -- "${bindings_path}" "${backup_path}"
+  log "已备份 Hyprland 快捷键配置: ${backup_path}"
+}
+
+install_hyprland_shortcut() {
+  local bindings_path
+  bindings_path="$(hyprland_bindings_path)"
+  [[ -f "${bindings_path}" ]] || die "未找到 Hyprland 快捷键配置: ${bindings_path}"
+  [[ "${SHORTCUT_BINDING}" =~ ^[A-Za-z0-9_+[:space:]-]+$ ]] || die "不支持的 Hyprland 快捷键格式: ${SHORTCUT_BINDING}"
+
+  local already_managed=0
+  grep -q '^-- BEGIN OPENTYLESS MANAGED SHORTCUT$' "${bindings_path}" && already_managed=1
+  if [[ ${already_managed} -eq 0 ]] && command -v omarchy >/dev/null 2>&1; then
+    if omarchy menu keybindings --print 2>/dev/null | awk -F '→' -v wanted="${SHORTCUT_BINDING}" '
+      { key=$1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", key); if (toupper(key) == toupper(wanted)) found=1 }
+      END { exit(found ? 0 : 1) }
+    '; then
+      [[ ${FORCE_SHORTCUT} -eq 1 ]] || die "快捷键 ${SHORTCUT_BINDING} 已被占用；请更换 --binding，或确认后使用 --force"
+      warn "将覆盖已经存在的快捷键: ${SHORTCUT_BINDING}"
+    fi
+  fi
+
+  backup_hyprland_bindings "${bindings_path}"
+  remove_managed_hyprland_block "${bindings_path}"
+  {
+    printf '\n-- BEGIN OPENTYLESS MANAGED SHORTCUT\n'
+    printf 'hl.unbind("%s")\n' "${SHORTCUT_BINDING}"
+    printf 'o.bind("%s", "OpenTyless voice input", "%s")\n' "${SHORTCUT_BINDING}" "${HOTKEY_WRAPPER_PATH}"
+    printf '%s\n' '-- END OPENTYLESS MANAGED SHORTCUT'
+  } >> "${bindings_path}"
+  log "已安装 Hyprland 快捷键: ${SHORTCUT_BINDING} -> ${HOTKEY_WRAPPER_PATH}"
+}
+
+uninstall_hyprland_shortcut() {
+  local bindings_path
+  bindings_path="$(hyprland_bindings_path)"
+  [[ -f "${bindings_path}" ]] || die "未找到 Hyprland 快捷键配置: ${bindings_path}"
+  if ! grep -q '^-- BEGIN OPENTYLESS MANAGED SHORTCUT$' "${bindings_path}"; then
+    log "未发现由 OpenTyless 管理的 Hyprland 快捷键"
+    return
+  fi
+  backup_hyprland_bindings "${bindings_path}"
+  remove_managed_hyprland_block "${bindings_path}"
+  log "已移除 OpenTyless Hyprland 快捷键"
 }
 
 main() {
   log "检测到桌面会话: session=${SESSION_TYPE}, desktop=${CURRENT_DESKTOP}"
 
+  if [[ -z "${SHORTCUT_BINDING}" ]]; then
+    case "${CURRENT_DESKTOP}" in
+      *Hyprland*|*hyprland*) SHORTCUT_BINDING="SUPER + V" ;;
+      *) SHORTCUT_BINDING="<Super>v" ;;
+    esac
+  fi
+
+  if [[ ${UNINSTALL_SHORTCUT} -eq 1 ]]; then
+    case "${CURRENT_DESKTOP}" in
+      *Hyprland*|*hyprland*) uninstall_hyprland_shortcut ;;
+      *) die "自动卸载快捷键目前仅支持 Hyprland/Omarchy" ;;
+    esac
+    exit 0
+  fi
+
   if [[ ${SKIP_DEPS} -eq 0 ]]; then
     install_apt_deps
+    install_arch_deps
   fi
 
   ensure_rust
   prepare_env_file
+  secure_env_file
   configure_session_env_defaults
   build_release
   install_binary

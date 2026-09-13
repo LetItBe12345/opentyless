@@ -243,8 +243,22 @@ impl Recorder {
     }
 
     fn stop(mut self) -> Result<PathBuf> {
-        self.child.kill().ok();
+        // ffmpeg must receive a graceful interrupt so it can finalize the WAV
+        // header. SIGKILL leaves the pre-created output file empty/corrupt.
+        #[cfg(unix)]
+        {
+            unsafe {
+                libc::kill(self.child.id() as libc::pid_t, libc::SIGINT);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            self.child.kill().ok();
+        }
         self.child.wait().ok();
+        if !self.audio_path.is_file() || fs::metadata(&self.audio_path)?.len() == 0 {
+            bail!("录音文件为空，请确认麦克风和录音设备可用");
+        }
         Ok(self.audio_path)
     }
 }
@@ -366,11 +380,15 @@ impl Daemon {
     fn new(config: Config) -> Result<Self> {
         fs::create_dir_all(&config.run_dir)?;
         fs::create_dir_all(&config.state_dir)?;
+        let previous = State::load(&config.state_path());
         let state = State {
             pid: Some(std::process::id()),
             mode: Some("daemon".into()),
             started_at: Some(Local::now().to_rfc3339()),
             last_event: Some("daemon_started".into()),
+            last_raw_text: previous.last_raw_text,
+            last_polished_text: previous.last_polished_text,
+            last_output_path: previous.last_output_path,
             ..State::default()
         };
         state.save(&config.state_path())?;
@@ -431,6 +449,9 @@ impl Daemon {
             "toggle-record" => {
                 if self.recorder.is_some() {
                     self.stop_record()
+                } else if self.pipeline_in_progress() {
+                    notify_event(&self.config, "OpenTyless", "正在转写").ok();
+                    Ok("正在转写".into())
                 } else {
                     self.start_record()
                 }
@@ -455,6 +476,19 @@ impl Daemon {
                     state: Some(self.state.clone()),
                 }
             }
+        }
+    }
+
+    fn pipeline_in_progress(&mut self) -> bool {
+        let disk_state = State::load(&self.config.state_path());
+        if disk_state.last_event.as_deref() == Some("transcribing") {
+            self.state = disk_state;
+            true
+        } else {
+            if self.recorder.is_none() {
+                self.state = disk_state;
+            }
+            false
         }
     }
 
@@ -486,7 +520,7 @@ impl Daemon {
         self.state.audio_path = Some(audio_path.display().to_string());
         self.state.error = None;
         self.state.save(&self.config.state_path())?;
-        notify_event(&self.config, "OpenTyless", "已停止录音，正在转写").ok();
+        notify_event(&self.config, "OpenTyless", "正在转写").ok();
         spawn_pipeline_job(self.config.clone(), audio_path.clone());
 
         Ok(format!("已停止录音，正在转写: {}", audio_path.display()))
@@ -516,21 +550,7 @@ fn spawn_pipeline_job(config: Config, audio_path: PathBuf) {
         let result: Result<(String, String, PathBuf)> = (|| {
             config.validate_inference()?;
             let pipeline = Pipeline::new(config.clone())?;
-            let (raw_text, polished_text, output_path) = pipeline.run(&audio_path)?;
-            let clipboard_result = maybe_copy_to_clipboard(&config, &polished_text);
-            let notify_body = match clipboard_result {
-                Ok(()) => format!(
-                    "转写完成，已复制到剪贴板\n{}",
-                    truncate_text(&polished_text, 80)
-                ),
-                Err(error) => format!(
-                    "转写完成，但复制到剪贴板失败：{}\n{}",
-                    error,
-                    truncate_text(&polished_text, 80)
-                ),
-            };
-            notify_event(&config, "OpenTyless", &notify_body).ok();
-            Ok((raw_text, polished_text, output_path))
+            pipeline.run(&audio_path)
         })();
 
         let mut state = State::load(&state_path);
@@ -538,17 +558,31 @@ fn spawn_pipeline_job(config: Config, audio_path: PathBuf) {
             Ok((raw_text, polished_text, output_path)) => {
                 state.last_event = Some("pipeline_completed".into());
                 state.last_raw_text = Some(raw_text);
-                state.last_polished_text = Some(polished_text);
+                state.last_polished_text = Some(polished_text.clone());
                 state.last_output_path = Some(output_path.display().to_string());
                 state.error = None;
+                state.save(&state_path).ok();
+                match maybe_copy_to_clipboard(&config, &polished_text) {
+                    Ok(()) => {
+                        notify_event(&config, "OpenTyless", "转写成功").ok();
+                    }
+                    Err(error) => {
+                        notify_event(
+                            &config,
+                            "OpenTyless",
+                            &format!("转写成功，但复制到剪贴板失败：{error}"),
+                        )
+                        .ok();
+                    }
+                }
             }
             Err(error) => {
                 state.last_event = Some("pipeline_failed".into());
                 state.error = Some(error.to_string());
+                state.save(&state_path).ok();
                 notify_event(&config, "OpenTyless 错误", &error.to_string()).ok();
             }
         }
-        state.save(&state_path).ok();
     });
 }
 
@@ -678,7 +712,7 @@ fn cmd_copy_last(config: &Config) -> Result<()> {
     let text = state
         .last_polished_text
         .ok_or_else(|| anyhow!("最近没有可复制的整理结果"))?;
-    maybe_copy_to_clipboard(config, &text)?;
+    copy_to_clipboard(config, &text)?;
     println!("已复制最近一次整理文本到剪贴板");
     Ok(())
 }
@@ -812,14 +846,7 @@ fn cmd_systemctl(args: &[&str]) -> Result<()> {
 
 fn cmd_logs(unit: &str, lines: usize) -> Result<()> {
     let output = Command::new("journalctl")
-        .args([
-            "--user",
-            "-u",
-            unit,
-            "-n",
-            &lines.to_string(),
-            "--no-pager",
-        ])
+        .args(["--user", "-u", unit, "-n", &lines.to_string(), "--no-pager"])
         .output()?;
     print_output(output);
     Ok(())
@@ -1527,17 +1554,15 @@ fn maybe_copy_to_clipboard(config: &Config, text: &str) -> Result<()> {
     if !config.auto_copy {
         return Ok(());
     }
+    copy_to_clipboard(config, text)
+}
+
+fn copy_to_clipboard(config: &Config, text: &str) -> Result<()> {
     let command = detect_clipboard_command(config)
-        .ok_or_else(|| anyhow!("未检测到剪贴板命令，已跳过自动复制"))?;
-    if command
-        .first()
-        .map(|program| should_detach_stdin_command(program))
-        .unwrap_or(false)
-    {
-        spawn_command_with_stdin_detached(&command[0], &command[1..], text)
-    } else {
-        run_command_with_stdin(&command[0], &command[1..], text)
-    }
+        .ok_or_else(|| anyhow!("未检测到剪贴板命令"))?;
+    // xclip and wl-copy both keep the clipboard buffer alive; never block the
+    // transcription pipeline or tray action on them.
+    spawn_command_with_stdin_detached(&command[0], &command[1..], text)
 }
 
 fn notify_event(config: &Config, summary: &str, body: &str) -> Result<()> {
@@ -1576,25 +1601,6 @@ fn detect_clipboard_preview(config: &Config) -> Option<String> {
     detect_clipboard_command(config).map(|parts| parts.join(" "))
 }
 
-fn run_command_with_stdin(program: &str, args: &[String], input: &str) -> Result<()> {
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    apply_desktop_env(&mut command);
-    let mut child = command.spawn()?;
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(input.as_bytes())?;
-    }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        bail!(String::from_utf8_lossy(&output.stderr).trim().to_string());
-    }
-    Ok(())
-}
-
 fn spawn_command_with_stdin_detached(program: &str, args: &[String], input: &str) -> Result<()> {
     let mut command = Command::new(program);
     command
@@ -1604,20 +1610,26 @@ fn spawn_command_with_stdin_detached(program: &str, args: &[String], input: &str
         .stderr(Stdio::null());
     apply_desktop_env(&mut command);
     let mut child = command.spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(input.as_bytes())?;
-    }
+    let write_result = if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(input.as_bytes())
+    } else {
+        Ok(())
+    };
     thread::spawn(move || {
         let _ = child.wait();
     });
+    write_result.context(format!("写入 {program} 标准输入失败"))?;
     Ok(())
 }
 
+#[cfg(test)]
 fn should_detach_stdin_command(program: &str) -> bool {
-    Path::new(program)
-        .file_name()
-        .and_then(|name| name.to_str())
-        == Some("xclip")
+    matches!(
+        Path::new(program)
+            .file_name()
+            .and_then(|name| name.to_str()),
+        Some("xclip") | Some("wl-copy")
+    )
 }
 
 fn run_command(program: &str, args: &[&str]) -> Result<()> {
@@ -1660,7 +1672,8 @@ fn desktop_env_overrides() -> Vec<(String, String)> {
                 .as_deref()
                 .and_then(derive_runtime_dir_from_dbus_bus)
         });
-    let xauthority = manager_env_value(&manager_env, "XAUTHORITY").or_else(|| env_optional("XAUTHORITY"));
+    let xauthority =
+        manager_env_value(&manager_env, "XAUTHORITY").or_else(|| env_optional("XAUTHORITY"));
 
     if let Some(value) = dbus_bus {
         pairs.push(("DBUS_SESSION_BUS_ADDRESS".into(), value));
@@ -1851,7 +1864,27 @@ fn ensure_daemon_runtime_ready(config: &Config) -> Result<()> {
             .with_context(|| format!("清理残留 socket 失败: {}", config.socket_path.display()))?;
     }
 
+    cleanup_empty_recordings(&config.run_dir);
     Ok(())
+}
+
+fn cleanup_empty_recordings(run_dir: &Path) {
+    let Ok(entries) = fs::read_dir(run_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        if !name.starts_with("recording_") || !name.ends_with(".wav") {
+            continue;
+        }
+        if fs::metadata(&path).map(|meta| meta.len() == 0).unwrap_or(false) {
+            fs::remove_file(&path).ok();
+        }
+    }
 }
 
 fn socket_accepting_connections(socket_path: &Path) -> bool {
@@ -2156,7 +2189,52 @@ mod tests {
     fn absolute_xclip_path_uses_detached_clipboard_flow() {
         assert!(should_detach_stdin_command("xclip"));
         assert!(should_detach_stdin_command("/home/jin/.local/bin/xclip"));
-        assert!(!should_detach_stdin_command("wl-copy"));
+        assert!(should_detach_stdin_command("wl-copy"));
+        assert!(should_detach_stdin_command("/usr/bin/wl-copy"));
+        assert!(!should_detach_stdin_command("notify-send"));
+    }
+
+    #[test]
+    fn daemon_new_preserves_last_transcript() {
+        let temp = tempdir().unwrap();
+        let mut config = sample_config();
+        config.run_dir = temp.path().join("run");
+        config.state_dir = temp.path().join("state");
+        config.socket_path = config.run_dir.join("opentyless.sock");
+        fs::create_dir_all(&config.run_dir).unwrap();
+        fs::create_dir_all(&config.state_dir).unwrap();
+        let previous = State {
+            last_raw_text: Some("原文".into()),
+            last_polished_text: Some("整理".into()),
+            last_output_path: Some("/tmp/out.md".into()),
+            last_event: Some("pipeline_completed".into()),
+            recording: true,
+            ..State::default()
+        };
+        previous.save(&config.state_path()).unwrap();
+
+        let daemon = Daemon::new(config).unwrap();
+        assert_eq!(daemon.state.last_polished_text.as_deref(), Some("整理"));
+        assert_eq!(daemon.state.last_raw_text.as_deref(), Some("原文"));
+        assert_eq!(daemon.state.last_event.as_deref(), Some("daemon_started"));
+        assert!(!daemon.state.recording);
+    }
+
+    #[test]
+    fn cleanup_empty_recordings_removes_only_empty_wavs() {
+        let temp = tempdir().unwrap();
+        let empty = temp.path().join("recording_empty.wav");
+        let nonempty = temp.path().join("recording_ok.wav");
+        let other = temp.path().join("notes.txt");
+        fs::write(&empty, b"").unwrap();
+        fs::write(&nonempty, b"RIFF").unwrap();
+        fs::write(&other, b"").unwrap();
+
+        cleanup_empty_recordings(temp.path());
+
+        assert!(!empty.exists());
+        assert!(nonempty.exists());
+        assert!(other.exists());
     }
 
     #[test]
@@ -2242,8 +2320,10 @@ mod tests {
 
         let pid_path = run_dir.join("opentyless.pid");
         let socket_path = run_dir.join("opentyless.sock");
+        let empty_wav = run_dir.join("recording_stale.wav");
         let child = Command::new("sleep").arg("5").spawn().unwrap();
         fs::write(&pid_path, child.id().to_string()).unwrap();
+        fs::write(&empty_wav, b"").unwrap();
         let listener = UnixListener::bind(&socket_path).unwrap();
         drop(listener);
 
@@ -2256,6 +2336,7 @@ mod tests {
 
         assert!(!pid_path.exists());
         assert!(!socket_path.exists());
+        assert!(!empty_wav.exists());
 
         let mut child = child;
         child.kill().ok();
@@ -2266,7 +2347,10 @@ mod tests {
     fn render_tray_service_has_restart_always_and_depends_on_daemon() {
         let config = sample_config();
         let unit = render_tray_service(&config);
-        assert!(unit.contains("Restart=always"), "should have Restart=always");
+        assert!(
+            unit.contains("Restart=always"),
+            "should have Restart=always"
+        );
         assert!(
             unit.contains("Requires=opentyless.service"),
             "should depend on daemon service"

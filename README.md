@@ -105,6 +105,16 @@ Common flags:
 ./install.sh --install-shortcut --binding 'F8'
 ```
 
+Recommended on Omarchy / Hyprland:
+
+```bash
+./install.sh --install-shortcut --binding 'SUPER + V'
+```
+
+The installer backs up `~/.config/hypr/bindings.lua` and maintains a marked,
+idempotent OpenTyless block. It stops on shortcut conflicts unless `--force` is
+provided. Remove the managed binding with `./install.sh --uninstall-shortcut`.
+
 ### Option B: manual installation
 
 Install dependencies on Debian / Ubuntu:
@@ -252,6 +262,8 @@ opentyless-rs status
   Ask the daemon to stop recording, return immediately, notify that transcription is starting, then run transcription and cleanup in the background.
 - `opentyless-rs toggle-record`
   Toggle between start and stop; this is the best shortcut target.
+  While transcription is running, another toggle is ignored and reports that
+  transcription is still in progress.
 - `opentyless-rs once --seconds 5`
   Record for a fixed number of seconds and process once without using the daemon.
 
@@ -334,6 +346,7 @@ Tray menu behavior:
 ## Wayland and X11 Notes
 
 - On Wayland, prefer desktop shortcuts bound to `toggle-record` instead of app-level key hooks
+- On Omarchy / Hyprland, use `--install-shortcut` to manage the Lua binding; `SUPER + V` is recommended
 - X11 and Wayland share the same daemon, service, tray, and transcription pipeline
 - Clipboard defaults are now chosen from `XDG_SESSION_TYPE`:
   - `wayland` prefers `wl-copy`

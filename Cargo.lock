@@ -852,6 +852,7 @@ dependencies = [
  "clap",
  "dotenvy",
  "ksni",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

@@ -105,6 +105,16 @@ chmod +x install.sh
 ./install.sh --install-shortcut --binding 'F8'
 ```
 
+在 Omarchy / Hyprland 下推荐：
+
+```bash
+./install.sh --install-shortcut --binding 'SUPER + V'
+```
+
+安装器会先备份 `~/.config/hypr/bindings.lua`，然后维护一个带标记、可重复更新的
+OpenTyless 配置区块。若快捷键已被占用，安装会停止；确认覆盖时显式增加
+`--force`。运行 `./install.sh --uninstall-shortcut` 可移除托管区块。
+
 ### 方案二：手动安装
 
 Debian / Ubuntu 依赖：
@@ -252,6 +262,7 @@ opentyless-rs status
   通知 daemon 停止录音并立即返回，然后在后台开始转写和整理；现在会先提示“已停止录音，正在转写”，完成后再提示“转写完成”。
 - `opentyless-rs toggle-record`
   在开始录音和停止并转写之间切换；最适合绑快捷键。
+  转写期间再次触发不会开始新录音，只会提示“正在转写”。
 - `opentyless-rs once --seconds 5`
   不走 daemon，直接录音固定秒数并处理一次。
 
@@ -327,6 +338,7 @@ opentyless-rs tray
 ## Wayland 与 X11 说明
 
 - Wayland 下推荐把桌面快捷键绑定到 `toggle-record`，程序不依赖自己监听全局按键
+- Omarchy / Hyprland 下可使用安装器的 `--install-shortcut` 管理 Lua 快捷键配置；推荐使用 `SUPER + V`
 - X11 与 Wayland 共用同一套 daemon、service、tray 和转写主流程
 - 当前程序会优先根据 `XDG_SESSION_TYPE` 选择剪贴板默认值：
   - `wayland` 优先 `wl-copy`
