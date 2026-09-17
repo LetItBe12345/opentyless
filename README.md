@@ -13,18 +13,17 @@ It is built around:
 
 For release and publishing workflows, see [Release Guide](docs/RELEASE.md).
 
-## Release Tracks
+## Release Model
 
-This repository currently maintains two release tracks:
+This repository now uses one main feature line and one release flow:
 
-- `master`: the default Wayland-oriented track
-- `x11`: the X11-focused track, including installer defaults tuned for X11 clipboard behavior and desktop startup
-
-Use the track that matches the desktop environment you want to ship.
+- there is a single Rust codepath
+- there is a single primary release artifact
+- Wayland / X11 differences are handled through environment detection and installer defaults
 
 ## Why This Architecture
 
-On modern Linux desktops, especially GNOME Wayland, background apps are not reliable places to listen for global hotkeys.
+On modern Linux desktops, especially GNOME Wayland, background apps are not reliable places to listen for global hotkeys. At the same time, X11 and Wayland still need slightly different clipboard and desktop-integration defaults.
 
 So the project is structured like this:
 
@@ -46,6 +45,36 @@ The desktop environment is responsible for the shortcut. The CLI is responsible 
 - desktop notifications for start, stop, and completion
 
 ## Installation
+
+There are currently three supported installation / distribution paths:
+
+- `git clone` + `./install.sh`
+  This is source installation; the Rust binary is built locally on the user's machine.
+- GitHub Release archive
+  This is prebuilt binary installation; users download an artifact that you built ahead of time.
+- `npm i -g opentyless@latest`
+  This is package-manager distribution; the npm package is a thin installer shell that prefers the bundled prebuilt Rust runtime and falls back to GitHub Releases if needed.
+
+If you are a developer, source installation is the best fit. If you are an end user, GitHub Release or npm is usually more convenient.
+
+### Option 0: install through npm
+
+If you want a `codex`-style install and upgrade flow, you can distribute OpenTyless through npm:
+
+```bash
+npm i -g opentyless@latest
+```
+
+Then run:
+
+```bash
+opentyless --help
+opentyless doctor
+```
+
+The npm package is only a thin wrapper. During `postinstall`, it first installs the bundled Rust runtime from the package itself, and only falls back to GitHub Releases if that bundled runtime is missing.
+
+See [`docs/NPM.zh-CN.md`](docs/NPM.zh-CN.md) for the current packaging notes.
 
 ### Option A: one-shot installer
 
@@ -75,6 +104,26 @@ Common flags:
 ./install.sh --no-tray
 ./install.sh --install-shortcut --binding 'F8'
 ```
+
+Recommended on Omarchy / Hyprland:
+
+```bash
+./install.sh --install-shortcut
+./install.sh --install-shortcut --binding 'SUPER + V' --binding 'CTRL + V'
+```
+
+Hyprland defaults are `SUPER + V` and `CTRL + V`, both bound to `toggle-record`.
+`CTRL + V` is captured by the compositor, so applications will not receive paste
+while that binding is installed. Pass `--binding` yourself if you want a
+different set.
+
+The installer backs up `~/.config/hypr/bindings.lua` and maintains a marked,
+idempotent OpenTyless block. It stops on shortcut conflicts unless `--force` is
+provided. Remove the managed binding with `./install.sh --uninstall-shortcut`.
+
+Installed systemd user units pin `WorkingDirectory` and `EnvironmentFile` to
+`~/.config/opentyless`, and copy `.env` there during `install-service`. Moving
+or deleting the source checkout after install will not break login autostart.
 
 ### Option B: manual installation
 
@@ -135,6 +184,8 @@ Defaults already assume DashScope compatible mode:
 Useful optional variables:
 
 - `RECORDER_CMD`: override the recording command
+- `FLASH_PROMPT`: override the cleanup system prompt; requests already wrap transcripts in `<raw_transcript>...</raw_transcript>`, force JSON mode, and use low-temperature decoding
+- `FLASH_EXTRA_BODY_JSON`: merge extra JSON into the cleanup request body; defaults already include `response_format={"type":"json_object"}`, `temperature=0.1`, and `seed=7`
 - `AUTO_COPY_TO_CLIPBOARD`: enable or disable automatic copy
 - `CLIPBOARD_COMMAND`: force `xclip`, `wl-copy`, or a custom command
 - `ENABLE_NOTIFICATIONS`: enable or disable desktop notifications
@@ -146,6 +197,29 @@ Default runtime directories are absolute XDG-style paths:
 - `STATE_DIR`: `~/.local/state/opentyless/state`
 - `OUTPUT_DIR`: `~/.local/share/opentyless/outputs`
 - `SOCKET_PATH`: `~/.local/state/opentyless/run/opentyless.sock`
+
+## Installation Model Notes
+
+### Why keep `install.sh`, GitHub Release, and npm at the same time
+
+- `install.sh`
+  Best for source installs and development; it runs `cargo build --release` locally and therefore depends on the user's Rust toolchain.
+- GitHub Release
+  Best for end users who want a ready-to-use archive without installing Rust locally.
+- npm
+  Best for a modern CLI install / upgrade flow; in practice it still distributes a prebuilt binary, but through an npm-managed entrypoint.
+
+### Why not only use Cargo
+
+- `cargo` is excellent for Rust developers
+- but the mainstream `cargo install` flow still means downloading source and compiling locally
+- for general Linux desktop users, GitHub Release or npm is usually simpler
+
+So the current positioning is:
+
+- development and debugging: `cargo`
+- source install: `git clone` + `./install.sh`
+- end-user distribution: GitHub Release / npm
 
 ## Quick Start
 
@@ -198,6 +272,8 @@ opentyless-rs status
   Ask the daemon to stop recording, return immediately, notify that transcription is starting, then run transcription and cleanup in the background.
 - `opentyless-rs toggle-record`
   Toggle between start and stop; this is the best shortcut target.
+  While transcription is running, another toggle is ignored and reports that
+  transcription is still in progress.
 - `opentyless-rs once --seconds 5`
   Record for a fixed number of seconds and process once without using the daemon.
 
@@ -270,19 +346,23 @@ Start the tray manually:
 opentyless-rs tray
 ```
 
+Tray menu behavior:
+
+- Idle: show `开始录音`、`复制最近结果`、`打开输出目录`、`显示状态通知`、`退出托盘`
+- Recording: replace `开始录音` with `停止录音` and add `取消录音`
+- `停止录音` will continue into transcription and clipboard copy
+- `取消录音` will discard the current recording without transcription or clipboard updates
+
 ## Wayland and X11 Notes
 
-### Wayland
-
-- prefer desktop shortcuts bound to `toggle-record`
-- clipboard defaults should usually point to `wl-copy`
-- direct text injection into the focused input is intentionally not the default behavior
-
-### X11
-
-- the `x11` branch and `x11` release track tune installer defaults around `xclip`
-- if needed, set `RECORDER_CMD` explicitly to the correct ALSA or Pulse device
-- GNOME on X11 can still use the same daemon, service, tray, and shortcut workflow
+- On Wayland, prefer desktop shortcuts bound to `toggle-record` instead of app-level key hooks
+- On Omarchy / Hyprland, use `--install-shortcut` to manage the Lua bindings; defaults are `SUPER + V` and `CTRL + V`
+- X11 and Wayland share the same daemon, service, tray, and transcription pipeline
+- Clipboard defaults are now chosen from `XDG_SESSION_TYPE`:
+  - `wayland` prefers `wl-copy`
+  - `x11` prefers `xclip`
+- Direct text injection into the focused input is intentionally not the default behavior
+- If your desktop has multiple clipboard tools installed, set `CLIPBOARD_COMMAND` explicitly
 
 ## Troubleshooting
 
@@ -321,3 +401,10 @@ systemctl --user restart opentyless.service
 pkill -f 'opentyless-rs tray' || true
 setsid -f ~/.local/bin/opentyless-rs tray >/tmp/opentyless-tray.log 2>&1
 ```
+
+## Roadmap
+
+- improve cross-desktop hotkey reliability and reduce the need for manual GNOME / Wayland / X11 shortcut debugging
+- evaluate more reliable hotkey trigger paths such as desktop extensions, platform-specific bridge layers, or stronger shortcut diagnostics
+- support multilingual UI and documentation
+- support multiple ASR / LLM API providers with switchable configuration

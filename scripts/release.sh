@@ -2,14 +2,18 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TRACK=""
 TAG=""
 TITLE=""
 PUSH_FIRST=0
 SKIP_BUILD=0
+TRACK=""
 
 log() {
   printf '[opentyless-release] %s\n' "$*"
+}
+
+warn() {
+  printf '[opentyless-release] warning: %s\n' "$*" >&2
 }
 
 die() {
@@ -20,29 +24,24 @@ die() {
 usage() {
   cat <<'EOF'
 Usage:
-  ./scripts/release.sh --track <wayland|x11> --tag <tag> [options]
+  ./scripts/release.sh --tag <tag> [options]
 
 Options:
-  --track <name>     Release track: wayland or x11
   --tag <tag>        Git tag / GitHub release tag
   --title <title>    Optional release title, defaults to tag
   --push-first       Push current branch before creating the release
   --skip-build       Reuse existing target/release binary
+  --track <name>     Deprecated compatibility flag; ignored
   -h, --help         Show help
 
 Examples:
-  ./scripts/release.sh --track wayland --tag v0.2.0 --push-first
-  ./scripts/release.sh --track x11 --tag v0.2.0-x11.1 --push-first
+  ./scripts/release.sh --tag v0.2.0 --push-first
+  ./scripts/release.sh --tag v0.2.1
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --track)
-      [[ $# -ge 2 ]] || die "--track requires a value"
-      TRACK="$2"
-      shift 2
-      ;;
     --tag)
       [[ $# -ge 2 ]] || die "--tag requires a value"
       TAG="$2"
@@ -61,6 +60,11 @@ while [[ $# -gt 0 ]]; do
       SKIP_BUILD=1
       shift
       ;;
+    --track)
+      [[ $# -ge 2 ]] || die "--track requires a value"
+      TRACK="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -71,22 +75,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -n "${TRACK}" ]] || die "--track is required"
 [[ -n "${TAG}" ]] || die "--tag is required"
 
-case "${TRACK}" in
-  wayland)
-    EXPECTED_BRANCH="master"
-    PACKAGE_SUFFIX="linux-x86_64"
-    ;;
-  x11)
-    EXPECTED_BRANCH="x11"
-    PACKAGE_SUFFIX="linux-x86_64"
-    ;;
-  *)
-    die "unsupported track: ${TRACK}"
-    ;;
-esac
+if [[ -n "${TRACK}" ]]; then
+  warn "--track 已废弃，当前发布流程统一为单发布线；收到值: ${TRACK}"
+fi
 
 if [[ -z "${TITLE}" ]]; then
   TITLE="${TAG}"
@@ -103,7 +96,6 @@ require_command gh
 require_command cargo
 
 CURRENT_BRANCH="$(git -C "${PROJECT_ROOT}" branch --show-current)"
-[[ "${CURRENT_BRANCH}" == "${EXPECTED_BRANCH}" ]] || die "track ${TRACK} must be released from branch ${EXPECTED_BRANCH}, current branch is ${CURRENT_BRANCH}"
 
 if [[ -n "$(git -C "${PROJECT_ROOT}" status --short --untracked-files=no)" ]]; then
   die "working tree has tracked changes; commit or stash them first"
@@ -126,6 +118,7 @@ fi
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "${PROJECT_ROOT}/Cargo.toml" | head -n 1)"
 [[ -n "${VERSION}" ]] || die "failed to read version from Cargo.toml"
 
+PACKAGE_SUFFIX="linux-x86_64"
 PACKAGE_BASENAME="opentyless-rs-${TAG}-${PACKAGE_SUFFIX}"
 DIST_DIR="${PROJECT_ROOT}/dist"
 PACKAGE_DIR="${DIST_DIR}/${PACKAGE_BASENAME}"
@@ -147,13 +140,16 @@ sha256sum "${ARCHIVE_PATH}" > "${CHECKSUM_PATH}"
 
 RELEASE_NOTES="$(mktemp)"
 cat > "${RELEASE_NOTES}" <<EOF
-Release track: ${TRACK}
 Branch: ${CURRENT_BRANCH}
 Version: ${VERSION}
 
 Artifacts:
 - $(basename "${ARCHIVE_PATH}")
 - $(basename "${CHECKSUM_PATH}")
+
+Desktop integration:
+- Runtime chooses clipboard defaults from XDG_SESSION_TYPE
+- install.sh also auto-tunes clipboard/tray defaults from the desktop session
 
 Documentation:
 - English: README.md

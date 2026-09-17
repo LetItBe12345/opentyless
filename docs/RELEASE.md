@@ -2,21 +2,18 @@
 
 # Release Guide
 
-This repository currently ships two release tracks:
+This repository now ships one primary release line:
 
-- Wayland track from `master`
-- X11 track from `x11`
+- the core feature set is maintained in one place
+- Wayland / X11 differences are handled through environment detection and installer defaults
 
 The default documentation entrypoint is [README.md](../README.md). The Chinese mirror is [README.zh-CN.md](../README.zh-CN.md).
 
 ## Branch Policy
 
-- `master`
-  The default branch. Use it for the Wayland-oriented build and release line.
-- `x11`
-  The X11-oriented branch. Use it for X11-focused releases and installer behavior.
-
-Do not mix track-specific installer behavior into the wrong branch unless you intend to make it part of both tracks.
+- Prefer one main feature branch
+- If an old `x11` branch still exists, treat it as migration history rather than an ongoing long-term feature split
+- New behavior differences should be handled by environment detection, defaults, and docs instead of separate release tracks
 
 ## Documentation Policy
 
@@ -32,13 +29,8 @@ If a user-visible behavior changes, update docs first or in the same commit.
 
 Recommended naming:
 
-- Wayland releases: `vX.Y.Z`
-- X11 releases: `vX.Y.Z-x11.N`
-
-Examples:
-
-- `v0.2.0`
-- `v0.2.0-x11.1`
+- `vX.Y.Z`
+- `vX.Y.Z-beta.N`
 
 ## Pre-release Checklist
 
@@ -46,7 +38,7 @@ Examples:
 2. Push the branch first.
 3. Build the release binary locally.
 4. Verify docs are updated in both languages.
-5. Verify `install.sh` matches the target track behavior.
+5. Verify `install.sh` and runtime defaults still match the environment-adaptive behavior.
 6. Confirm the generated binary starts and the daemon can run.
 
 ## Recommended Release Script
@@ -54,13 +46,11 @@ Examples:
 Use:
 
 ```bash
-./scripts/release.sh --track wayland --tag v0.2.0
-./scripts/release.sh --track x11 --tag v0.2.0-x11.1
+./scripts/release.sh --tag v0.2.0
 ```
 
 What the script does:
 
-- checks that you are on the expected branch
 - builds a release binary
 - stages a `dist/` package directory
 - creates a `.tar.gz` artifact
@@ -70,22 +60,11 @@ What the script does:
 
 ## Manual Release Workflow
 
-### Wayland release from `master`
-
 ```bash
 git checkout master
 git pull --ff-only
 git push origin master
-./scripts/release.sh --track wayland --tag v0.2.0
-```
-
-### X11 release from `x11`
-
-```bash
-git checkout x11
-git pull --ff-only
-git push origin x11
-./scripts/release.sh --track x11 --tag v0.2.0-x11.1
+./scripts/release.sh --tag v0.2.0
 ```
 
 ## Artifacts
@@ -98,8 +77,29 @@ The release archive contains:
 - `README.zh-CN.md`
 - `.env.example`
 
+## npm Distribution
+
+The repository root now contains a thin npm distribution layer:
+
+- `package.json`: npm package manifest
+- `lib/postinstall.js`: installs the bundled runtime first, then falls back to GitHub Releases if needed
+- `bin/opentyless.js`: forwards to the Rust binary
+- `bin/opentyless-hotkey-toggle.js`: forwards to the hotkey wrapper script
+
+Recommended flow:
+
+1. Run `npm pack` first and confirm `prepack` bundled the Rust runtime into the npm tarball.
+2. Publish the GitHub Release as a fallback download source.
+3. Run `npm publish` from the repository root.
+
+By default npm version `0.1.0` maps to GitHub tag `v0.1.0`. To target a different tag during install, use:
+
+```bash
+OPENTYLESS_RELEASE_TAG=v0.2.0 npm i -g opentyless@0.2.0
+```
+
 ## Notes
 
 - `gh` must be installed and authenticated.
 - `dist/` is treated as a generated directory and should not be committed.
-- If a release is meant for both tracks, cut two releases from the two branches instead of pretending one artifact covers both desktop assumptions.
+- A single release artifact should adapt to both Wayland and X11 through environment-aware defaults rather than long-term split release tracks.

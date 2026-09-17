@@ -13,18 +13,17 @@ OpenTyless 是一个面向桌面工作流的轻量 Rust 语音转写 CLI。它�
 
 发布和打包流程见 [发布指南](docs/RELEASE.zh-CN.md)。
 
-## 发布线
+## 发布方式
 
-当前仓库维护两条发布线：
+当前仓库采用一套主功能、一套发布逻辑：
 
-- `master`：默认的 Wayland 取向版本
-- `x11`：面向 X11 的版本，安装脚本默认值和桌面启动行为更偏向 X11/GNOME
-
-需要发哪个版本，就从对应分支构建和发布。
+- 核心 Rust 代码只有一套
+- release 产物只有一条主发布线
+- Wayland / X11 的差异通过运行时环境检测和安装默认值处理
 
 ## 为什么这样设计
 
-在现代 Linux 桌面里，尤其是 GNOME Wayland，后台程序并不适合可靠监听全局快捷键。
+在现代 Linux 桌面里，尤其是 GNOME Wayland，后台程序并不适合可靠监听全局快捷键；而 X11 与 Wayland 在剪贴板、托盘和桌面集成上又存在不同默认值。
 
 因此项目结构是：
 
@@ -46,6 +45,36 @@ OpenTyless 是一个面向桌面工作流的轻量 Rust 语音转写 CLI。它�
 - 开始录音、停止转写、处理完成的桌面通知
 
 ## 安装
+
+当前支持三类安装/分发方式：
+
+- `git clone` + `./install.sh`
+  这是源码安装；会在用户自己的机器上本地编译 Rust 二进制。
+- GitHub Release 压缩包
+  这是预编译二进制安装；用户直接下载你提前构建好的产物再安装。
+- `npm i -g opentyless@latest`
+  这是包管理器分发；npm 包本身是一个很薄的安装壳，实际优先使用随包附带的预编译 Rust 二进制，缺失时再回退到 GitHub Release。
+
+如果你是开发者，推荐使用源码安装；如果你是普通用户，推荐使用 GitHub Release 或 npm。
+
+### 方案零：通过 npm 安装 Rust 二进制分发包
+
+适合你希望像 `codex` 一样，用 `npm` 统一安装和升级命令行工具。
+
+```bash
+npm i -g opentyless@latest
+```
+
+安装完成后可直接执行：
+
+```bash
+opentyless --help
+opentyless doctor
+```
+
+这个 npm 包本身不重新实现核心逻辑，而是优先携带预编译 Rust 二进制；安装时由 `postinstall` 解包到运行时目录，再由一个很薄的 Node 启动器转发命令。若随包运行时缺失，才回退到 GitHub Release 下载。
+
+更多说明见：[`docs/NPM.zh-CN.md`](docs/NPM.zh-CN.md)。
 
 ### 方案一：一键安装
 
@@ -75,6 +104,24 @@ chmod +x install.sh
 ./install.sh --no-tray
 ./install.sh --install-shortcut --binding 'F8'
 ```
+
+在 Omarchy / Hyprland 下推荐：
+
+```bash
+./install.sh --install-shortcut
+./install.sh --install-shortcut --binding 'SUPER + V' --binding 'CTRL + V'
+```
+
+Hyprland 默认同时绑定 `SUPER + V` 和 `CTRL + V`，都指向 `toggle-record`。
+`CTRL + V` 会被合成器拦截，应用内粘贴在该绑定存在期间不可用。若要改成别的键，请自己传 `--binding`。
+
+安装器会先备份 `~/.config/hypr/bindings.lua`，然后维护一个带标记、可重复更新的
+OpenTyless 配置区块。若快捷键已被占用，安装会停止；确认覆盖时显式增加
+`--force`。运行 `./install.sh --uninstall-shortcut` 可移除托管区块。
+
+systemd 用户服务会把 `WorkingDirectory` 和 `EnvironmentFile` 固定到
+`~/.config/opentyless`，并在 `install-service` 时把 `.env` 复制过去。
+安装完成后即使源码目录被移动或删除，登录自启动也不会因此失败。
 
 ### 方案二：手动安装
 
@@ -135,6 +182,8 @@ DASHSCOPE_API_KEY=your_dashscope_key
 常用可选变量：
 
 - `RECORDER_CMD`：自定义录音命令
+- `FLASH_PROMPT`：覆盖整理阶段的 system prompt；程序默认已经把原文包进 `<raw_transcript>...</raw_transcript>`，并强制 JSON mode + 低温度解码
+- `FLASH_EXTRA_BODY_JSON`：向整理请求体 merge 额外 JSON；默认已包含 `response_format={"type":"json_object"}`、`temperature=0.1`、`seed=7`
 - `AUTO_COPY_TO_CLIPBOARD`：是否自动复制
 - `CLIPBOARD_COMMAND`：显式指定 `xclip`、`wl-copy` 或自定义命令
 - `ENABLE_NOTIFICATIONS`：是否启用桌面通知
@@ -146,6 +195,29 @@ DASHSCOPE_API_KEY=your_dashscope_key
 - `STATE_DIR`：`~/.local/state/opentyless/state`
 - `OUTPUT_DIR`：`~/.local/share/opentyless/outputs`
 - `SOCKET_PATH`：`~/.local/state/opentyless/run/opentyless.sock`
+
+## 安装方式说明
+
+### 为什么这里同时保留 `install.sh`、Release 和 npm
+
+- `install.sh`
+  适合源码安装和开发调试；它会在本地执行 `cargo build --release`，因此依赖用户机器具备 Rust 工具链。
+- GitHub Release
+  适合给普通用户提供“开箱即用”的压缩包；不要求用户本地安装 Rust。
+- npm
+  适合提供类似现代 CLI 工具的安装与升级体验；本质上仍然是在分发预编译二进制，只是入口换成了 npm。
+
+### 为什么不只用 Cargo
+
+- `cargo` 非常适合 Rust 开发者
+- 但 `cargo install` 的主流使用方式通常仍然是下载源码并在本地编译
+- 对普通 Linux 桌面用户来说，GitHub Release 或 npm 的体验通常更简单
+
+因此当前项目的定位是：
+
+- 开发和调试：`cargo`
+- 源码安装：`git clone` + `./install.sh`
+- 成品分发：GitHub Release / npm
 
 ## 快速开始
 
@@ -198,6 +270,7 @@ opentyless-rs status
   通知 daemon 停止录音并立即返回，然后在后台开始转写和整理；现在会先提示“已停止录音，正在转写”，完成后再提示“转写完成”。
 - `opentyless-rs toggle-record`
   在开始录音和停止并转写之间切换；最适合绑快捷键。
+  转写期间再次触发不会开始新录音，只会提示“正在转写”。
 - `opentyless-rs once --seconds 5`
   不走 daemon，直接录音固定秒数并处理一次。
 
@@ -272,17 +345,14 @@ opentyless-rs tray
 
 ## Wayland 与 X11 说明
 
-### Wayland
-
-- 推荐把桌面快捷键绑定到 `toggle-record`
-- 剪贴板默认通常应当使用 `wl-copy`
+- Wayland 下推荐把桌面快捷键绑定到 `toggle-record`，程序不依赖自己监听全局按键
+- Omarchy / Hyprland 下可使用安装器的 `--install-shortcut` 管理 Lua 快捷键配置；默认同时使用 `SUPER + V` 和 `CTRL + V`
+- X11 与 Wayland 共用同一套 daemon、service、tray 和转写主流程
+- 当前程序会优先根据 `XDG_SESSION_TYPE` 选择剪贴板默认值：
+  - `wayland` 优先 `wl-copy`
+  - `x11` 优先 `xclip`
 - 当前默认策略不是向焦点输入框直接注入文本，而是复制到剪贴板后由你粘贴
-
-### X11
-
-- `x11` 分支和 `x11` 发布线会把安装默认值更偏向 `xclip`
-- 如有需要，建议显式设置 `RECORDER_CMD`
-- GNOME on X11 仍然适用同样的 daemon、service、tray 和快捷键流程
+- 如果系统同时装了多套剪贴板工具，也可以手动设置 `CLIPBOARD_COMMAND`
 
 ## 常见问题
 
@@ -321,3 +391,10 @@ systemctl --user restart opentyless.service
 pkill -f 'opentyless-rs tray' || true
 setsid -f ~/.local/bin/opentyless-rs tray >/tmp/opentyless-tray.log 2>&1
 ```
+
+## Roadmap
+
+- 提升跨桌面环境的热键稳定性，减少对手工调试 GNOME / Wayland / X11 快捷键的依赖
+- 评估更可靠的热键触发方案，例如桌面扩展、平台专用桥接层或更清晰的快捷键诊断工具
+- 支持多语言界面与文档
+- 支持多种 ASR / LLM API 提供商与可切换配置
