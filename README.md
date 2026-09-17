@@ -109,13 +109,10 @@ Recommended on Omarchy / Hyprland:
 
 ```bash
 ./install.sh --install-shortcut
-./install.sh --install-shortcut --binding 'SUPER + V' --binding 'CTRL + V'
+./install.sh --install-shortcut --binding 'SUPER + V' --binding 'C + V'
 ```
 
-Hyprland defaults are `SUPER + V` and `CTRL + V`, both bound to `toggle-record`.
-`CTRL + V` is captured by the compositor, so applications will not receive paste
-while that binding is installed. Pass `--binding` yourself if you want a
-different set.
+Hyprland defaults are `SUPER + V` and `C + V` (hold C, press V), both bound to `toggle-record`. This is not Control+V, so application paste is left alone. Pass `--binding` yourself if you want a different set.
 
 The installer backs up `~/.config/hypr/bindings.lua` and maintains a marked,
 idempotent OpenTyless block. It stops on shortcut conflicts unless `--force` is
@@ -356,7 +353,7 @@ Tray menu behavior:
 ## Wayland and X11 Notes
 
 - On Wayland, prefer desktop shortcuts bound to `toggle-record` instead of app-level key hooks
-- On Omarchy / Hyprland, use `--install-shortcut` to manage the Lua bindings; defaults are `SUPER + V` and `CTRL + V`
+- On Omarchy / Hyprland, use `--install-shortcut` to manage the Lua bindings; defaults are `SUPER + V` and `C + V`
 - X11 and Wayland share the same daemon, service, tray, and transcription pipeline
 - Clipboard defaults are now chosen from `XDG_SESSION_TYPE`:
   - `wayland` prefers `wl-copy`
