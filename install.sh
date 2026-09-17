@@ -40,7 +40,7 @@ usage() {
   --no-tray             不安装 GNOME 托盘自启动
   --install-shortcut    安装桌面快捷键
   --uninstall-shortcut  删除由 OpenTyless 管理的桌面快捷键后退出
-  --binding <keys>      快捷键绑定，可重复指定；Omarchy 默认 SUPER + V 与 CTRL + V，GNOME 默认 <Super>v
+  --binding <keys>      快捷键绑定，可重复指定；Omarchy 默认 SUPER + V 与 C + V，GNOME 默认 <Super>v
   --force               即使快捷键已被占用也覆盖（仅 Omarchy/Hyprland）
   -h, --help            显示帮助
 
@@ -361,6 +361,36 @@ hyprland_shortcut_bindings() {
   printf '%s\n' "${bindings[@]}"
 }
 
+hyprland_is_letter_chord() {
+  [[ "${1}" =~ ^[A-Za-z][[:space:]]*\+[[:space:]]*[A-Za-z]$ ]]
+}
+
+hyprland_chord_first() {
+  printf '%s' "${1%%+*}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]'
+}
+
+hyprland_chord_second() {
+  printf '%s' "${1#*+}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]'
+}
+
+emit_hyprland_binding() {
+  local binding="$1"
+  if hyprland_is_letter_chord "${binding}"; then
+    local first second
+    first="$(hyprland_chord_first "${binding}")"
+    second="$(hyprland_chord_second "${binding}")"
+    printf 'hl.unbind("%s")\n' "${second}"
+    printf 'o.bind("%s", "OpenTyless voice input", function()\n' "${second}"
+    printf '  if hl.is_key_down("%s") then\n' "${first}"
+    printf '    hl.exec_cmd("%s")\n' "${HOTKEY_WRAPPER_PATH}"
+    printf '  end\n'
+    printf 'end, { non_consuming = true })\n'
+  else
+    printf 'hl.unbind("%s")\n' "${binding}"
+    printf 'o.bind("%s", "OpenTyless voice input", "%s")\n' "${binding}" "${HOTKEY_WRAPPER_PATH}"
+  fi
+}
+
 install_hyprland_shortcut() {
   local bindings_path
   bindings_path="$(hyprland_bindings_path)"
@@ -379,6 +409,9 @@ install_hyprland_shortcut() {
 
   if command -v omarchy >/dev/null 2>&1; then
     for binding in "${bindings[@]}"; do
+      if hyprland_is_letter_chord "${binding}"; then
+        continue
+      fi
       if grep -Fq "o.bind(\"${binding}\", \"OpenTyless voice input\"" "${bindings_path}"; then
         continue
       fi
@@ -396,9 +429,9 @@ install_hyprland_shortcut() {
   remove_managed_hyprland_block "${bindings_path}"
   {
     printf '\n-- BEGIN OPENTYLESS MANAGED SHORTCUT\n'
+    printf 'hl.unbind("CTRL + V")\n'
     for binding in "${bindings[@]}"; do
-      printf 'hl.unbind("%s")\n' "${binding}"
-      printf 'o.bind("%s", "OpenTyless voice input", "%s")\n' "${binding}" "${HOTKEY_WRAPPER_PATH}"
+      emit_hyprland_binding "${binding}"
     done
     printf '%s\n' '-- END OPENTYLESS MANAGED SHORTCUT'
   } >> "${bindings_path}"
@@ -423,7 +456,7 @@ main() {
 
   if [[ ${#SHORTCUT_BINDINGS[@]} -eq 0 ]]; then
     case "${CURRENT_DESKTOP}" in
-      *Hyprland*|*hyprland*) SHORTCUT_BINDINGS=("SUPER + V" "CTRL + V") ;;
+      *Hyprland*|*hyprland*) SHORTCUT_BINDINGS=("SUPER + V" "C + V") ;;
       *) SHORTCUT_BINDINGS=("<Super>v") ;;
     esac
   fi

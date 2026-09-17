@@ -37,6 +37,10 @@ eval "$(extract_fn hyprland_bindings_path)"
 eval "$(extract_fn remove_managed_hyprland_block)"
 eval "$(extract_fn backup_hyprland_bindings)"
 eval "$(extract_fn hyprland_shortcut_bindings)"
+eval "$(extract_fn hyprland_is_letter_chord)"
+eval "$(extract_fn hyprland_chord_first)"
+eval "$(extract_fn hyprland_chord_second)"
+eval "$(extract_fn emit_hyprland_binding)"
 eval "$(extract_fn install_hyprland_shortcut)"
 eval "$(extract_fn uninstall_hyprland_shortcut)"
 
@@ -67,12 +71,17 @@ if (
 fi
 
 SHORTCUT_BINDING=""
-SHORTCUT_BINDINGS=("SUPER + V" "CTRL + V")
+SHORTCUT_BINDINGS=("SUPER + V" "C + V")
 install_hyprland_shortcut
 grep -q 'hl.unbind("SUPER + V")' "${HOME}/.config/hypr/bindings.lua"
 grep -q 'o.bind("SUPER + V", "OpenTyless voice input"' "${HOME}/.config/hypr/bindings.lua"
-grep -q 'hl.unbind("CTRL + V")' "${HOME}/.config/hypr/bindings.lua"
-grep -q 'o.bind("CTRL + V", "OpenTyless voice input"' "${HOME}/.config/hypr/bindings.lua"
+grep -q 'hl.is_key_down("c")' "${HOME}/.config/hypr/bindings.lua"
+grep -q 'o.bind("v", "OpenTyless voice input", function()' "${HOME}/.config/hypr/bindings.lua"
+grep -q 'non_consuming = true' "${HOME}/.config/hypr/bindings.lua"
+if grep -q 'o.bind("CTRL + V"' "${HOME}/.config/hypr/bindings.lua"; then
+  echo "CTRL + V must not be bound" >&2
+  exit 1
+fi
 count="$(grep -c '^-- BEGIN OPENTYLESS MANAGED SHORTCUT$' "${HOME}/.config/hypr/bindings.lua")"
 [[ "${count}" -eq 1 ]]
 
