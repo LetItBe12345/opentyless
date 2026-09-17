@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -10,7 +11,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use chrono::Local;
 use clap::{Args, Parser, Subcommand};
-use dotenvy::dotenv;
+
 use ksni::blocking::TrayMethods;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -103,7 +104,7 @@ struct Config {
 
 impl Config {
     fn load() -> Result<Self> {
-        let _ = dotenv();
+        load_env_files();
         Self::from_env()
     }
 
@@ -685,6 +686,16 @@ fn cmd_doctor(config: &Config) -> Result<()> {
     println!("RUN_DIR: {}", config.run_dir.display());
     println!("STATE_DIR: {}", config.state_dir.display());
     println!("SOCKET_PATH: {}", config.socket_path.display());
+    let env_path = installed_env_path();
+    println!(
+        "CONFIG_ENV: {} ({})",
+        env_path.display(),
+        if env_path.is_file() {
+            "存在"
+        } else {
+            "缺失"
+        }
+    );
     println!(
         "AUTO_COPY_TO_CLIPBOARD: {}",
         if config.auto_copy { "true" } else { "false" }
@@ -719,6 +730,7 @@ fn cmd_copy_last(config: &Config) -> Result<()> {
 
 fn cmd_install_service(config: &Config, enable: bool) -> Result<()> {
     ensure_systemctl()?;
+    ensure_installed_env_file()?;
     let service_dir = PathBuf::from(std::env::var("HOME")?).join(".config/systemd/user");
     fs::create_dir_all(&service_dir)?;
     let service_path = service_dir.join("opentyless.service");
@@ -795,6 +807,7 @@ fn cmd_install_tray_autostart() -> Result<()> {
 
 fn cmd_install_tray_service(config: &Config, enable: bool) -> Result<()> {
     ensure_systemctl()?;
+    ensure_installed_env_file()?;
     let service_dir = PathBuf::from(std::env::var("HOME")?).join(".config/systemd/user");
     fs::create_dir_all(&service_dir)?;
     let service_path = service_dir.join("opentyless-tray.service");
@@ -1420,39 +1433,56 @@ fn merge_json_object(target: &mut Value, extra: &Value) -> Result<()> {
 }
 
 fn render_service(_config: &Config) -> String {
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("cargo run --release --"));
-    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let exe = preferred_binary_path();
+    let workdir = installed_config_dir();
+    let env_file = installed_env_path();
     format!(
-        "[Unit]\nDescription=OpenTyless Rust daemon\nAfter=default.target\n\n[Service]\nType=simple\nWorkingDirectory={}\nEnvironmentFile={}\nExecStart={} daemon\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n",
-        root.display(),
-        root.join(".env").display(),
+        "[Unit]\n\
+         Description=OpenTyless Rust daemon\n\
+         After=default.target\n\
+         StartLimitIntervalSec=30\n\
+         StartLimitBurst=5\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         WorkingDirectory={}\n\
+         EnvironmentFile=-{}\n\
+         ExecStart={} daemon\n\
+         Restart=always\n\
+         RestartSec=2\n\
+         \n\
+         [Install]\n\
+         WantedBy=default.target\n",
+        workdir.display(),
+        env_file.display(),
         exe.display(),
     )
 }
 
 fn render_tray_service(_config: &Config) -> String {
     let exe = preferred_binary_path();
-    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let workdir = installed_config_dir();
+    let env_file = installed_env_path();
     format!(
         "[Unit]\n\
          Description=OpenTyless system tray indicator\n\
          After=graphical-session.target\n\
          PartOf=graphical-session.target\n\
-         Requires=opentyless.service\n\
+         Wants=opentyless.service\n\
          After=opentyless.service\n\
          \n\
          [Service]\n\
          Type=simple\n\
          WorkingDirectory={}\n\
-         EnvironmentFile={}\n\
+         EnvironmentFile=-{}\n\
          ExecStart={} tray\n\
          Restart=always\n\
          RestartSec=3\n\
          \n\
          [Install]\n\
          WantedBy=graphical-session.target\n",
-        root.display(),
-        root.join(".env").display(),
+        workdir.display(),
+        env_file.display(),
         exe.display(),
     )
 }
@@ -1946,6 +1976,50 @@ fn default_data_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+fn default_config_home() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn installed_config_dir() -> PathBuf {
+    default_config_home().join("opentyless")
+}
+
+fn installed_env_path() -> PathBuf {
+    installed_config_dir().join(".env")
+}
+
+fn load_env_files() {
+    let cwd_env = PathBuf::from(".env");
+    if cwd_env.is_file() {
+        let _ = dotenvy::from_path(&cwd_env);
+    }
+    let installed = installed_env_path();
+    if installed.is_file() {
+        let _ = dotenvy::from_path(&installed);
+    }
+}
+
+fn ensure_installed_env_file() -> Result<PathBuf> {
+    let dir = installed_config_dir();
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("无法创建配置目录: {}", dir.display()))?;
+    let dest = installed_env_path();
+    let cwd_env = PathBuf::from(".env");
+    if cwd_env.is_file() {
+        fs::copy(&cwd_env, &dest)
+            .with_context(|| format!("无法写入环境文件: {}", dest.display()))?;
+    }
+    if dest.is_file() {
+        let mut permissions = fs::metadata(&dest)?.permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&dest, permissions)?;
+    }
+    Ok(dest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2352,8 +2426,8 @@ mod tests {
             "should have Restart=always"
         );
         assert!(
-            unit.contains("Requires=opentyless.service"),
-            "should depend on daemon service"
+            unit.contains("Wants=opentyless.service"),
+            "should want daemon service without hard-failing if it is restarting"
         );
         assert!(
             unit.contains("After=opentyless.service"),
@@ -2374,8 +2448,8 @@ mod tests {
         let config = sample_config();
         let unit = render_tray_service(&config);
         assert!(
-            unit.contains("EnvironmentFile="),
-            "should reference an EnvironmentFile"
+            unit.contains("EnvironmentFile=-"),
+            "missing env file should not fail the unit"
         );
         assert!(
             unit.contains(".env"),
@@ -2389,6 +2463,86 @@ mod tests {
         let unit = render_service(&config);
         assert!(unit.contains("Restart=always"));
         assert!(unit.contains("daemon"));
+    }
+
+    #[test]
+    fn render_service_pins_xdg_config_not_source_cwd() {
+        let _guard = env_lock().lock().unwrap();
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("home");
+        let config_home = temp.path().join("config-home");
+        fs::create_dir_all(&home).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_config_home = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        }
+
+        let unit = render_service(&sample_config());
+        let expected_dir = config_home.join("opentyless");
+        let expected_env = expected_dir.join(".env");
+        assert!(unit.contains(&format!("WorkingDirectory={}", expected_dir.display())));
+        assert!(unit.contains(&format!("EnvironmentFile=-{}", expected_env.display())));
+        assert!(!unit.contains(&format!(
+            "WorkingDirectory={}",
+            std::env::current_dir().unwrap().display()
+        )));
+
+        unsafe {
+            match old_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match old_config_home {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn ensure_installed_env_file_copies_cwd_env() {
+        let _guard = env_lock().lock().unwrap();
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("home");
+        let config_home = temp.path().join("config-home");
+        let workdir = temp.path().join("src");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&workdir).unwrap();
+        fs::write(workdir.join(".env"), "DASHSCOPE_API_KEY=from-cwd\n").unwrap();
+
+        let old_home = std::env::var_os("HOME");
+        let old_config_home = std::env::var_os("XDG_CONFIG_HOME");
+        let old_cwd = std::env::current_dir().unwrap();
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        }
+        std::env::set_current_dir(&workdir).unwrap();
+
+        let dest = ensure_installed_env_file().unwrap();
+        assert_eq!(dest, config_home.join("opentyless/.env"));
+        assert_eq!(
+            fs::read_to_string(&dest).unwrap(),
+            "DASHSCOPE_API_KEY=from-cwd\n"
+        );
+        assert_eq!(
+            fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        unsafe {
+            match old_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match old_config_home {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
     }
 
     #[test]

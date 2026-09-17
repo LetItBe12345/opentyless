@@ -674,6 +674,7 @@ fn install_tray_service_writes_unit_file() {
     let output = Command::new(debug_exe())
         .arg("install-tray-service")
         .env("HOME", &fake_home)
+        .env_remove("XDG_CONFIG_HOME")
         .env("ASR_API_KEY", "test")
         .env("FLASH_API_KEY", "test")
         .stdout(Stdio::piped())
@@ -692,8 +693,18 @@ fn install_tray_service_writes_unit_file() {
     let content = fs::read_to_string(&unit_path).unwrap();
     assert!(content.contains("Restart=always"));
     assert!(content.contains("opentyless.service"));
+    assert!(content.contains("Wants=opentyless.service"));
     assert!(content.contains("tray"));
     assert!(content.contains("graphical-session.target"));
+    assert!(
+        content.contains("EnvironmentFile=-")
+            && content.contains(".config/opentyless/.env"),
+        "unit should pin an optional XDG env file: {content}"
+    );
+    assert!(
+        content.contains(".config/opentyless") && content.contains("WorkingDirectory="),
+        "unit should not depend on the source checkout: {content}"
+    );
 }
 
 #[test]

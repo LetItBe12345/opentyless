@@ -36,11 +36,13 @@ eval "$(extract_fn die)"
 eval "$(extract_fn hyprland_bindings_path)"
 eval "$(extract_fn remove_managed_hyprland_block)"
 eval "$(extract_fn backup_hyprland_bindings)"
+eval "$(extract_fn hyprland_shortcut_bindings)"
 eval "$(extract_fn install_hyprland_shortcut)"
 eval "$(extract_fn uninstall_hyprland_shortcut)"
 
 HOTKEY_WRAPPER_PATH="${HOME}/.local/bin/opentyless-hotkey-toggle"
 SHORTCUT_BINDING="SUPER + V"
+SHORTCUT_BINDINGS=()
 FORCE_SHORTCUT=0
 touch "${HOTKEY_WRAPPER_PATH}"
 
@@ -55,12 +57,25 @@ install_hyprland_shortcut
 count="$(grep -c '^-- BEGIN OPENTYLESS MANAGED SHORTCUT$' "${HOME}/.config/hypr/bindings.lua")"
 [[ "${count}" -eq 1 ]]
 
-if ( SHORTCUT_BINDING='bad;binding' install_hyprland_shortcut ); then
+if (
+  SHORTCUT_BINDINGS=()
+  SHORTCUT_BINDING='bad;binding'
+  install_hyprland_shortcut
+); then
   echo "invalid binding should be rejected" >&2
   exit 1
 fi
 
-SHORTCUT_BINDING="SUPER + V"
+SHORTCUT_BINDING=""
+SHORTCUT_BINDINGS=("SUPER + V" "CTRL + V")
+install_hyprland_shortcut
+grep -q 'hl.unbind("SUPER + V")' "${HOME}/.config/hypr/bindings.lua"
+grep -q 'o.bind("SUPER + V", "OpenTyless voice input"' "${HOME}/.config/hypr/bindings.lua"
+grep -q 'hl.unbind("CTRL + V")' "${HOME}/.config/hypr/bindings.lua"
+grep -q 'o.bind("CTRL + V", "OpenTyless voice input"' "${HOME}/.config/hypr/bindings.lua"
+count="$(grep -c '^-- BEGIN OPENTYLESS MANAGED SHORTCUT$' "${HOME}/.config/hypr/bindings.lua")"
+[[ "${count}" -eq 1 ]]
+
 uninstall_hyprland_shortcut
 if grep -q '^-- BEGIN OPENTYLESS MANAGED SHORTCUT$' "${HOME}/.config/hypr/bindings.lua"; then
   echo "managed block should be removed" >&2

@@ -108,12 +108,20 @@ chmod +x install.sh
 在 Omarchy / Hyprland 下推荐：
 
 ```bash
-./install.sh --install-shortcut --binding 'SUPER + V'
+./install.sh --install-shortcut
+./install.sh --install-shortcut --binding 'SUPER + V' --binding 'CTRL + V'
 ```
+
+Hyprland 默认同时绑定 `SUPER + V` 和 `CTRL + V`，都指向 `toggle-record`。
+`CTRL + V` 会被合成器拦截，应用内粘贴在该绑定存在期间不可用。若要改成别的键，请自己传 `--binding`。
 
 安装器会先备份 `~/.config/hypr/bindings.lua`，然后维护一个带标记、可重复更新的
 OpenTyless 配置区块。若快捷键已被占用，安装会停止；确认覆盖时显式增加
 `--force`。运行 `./install.sh --uninstall-shortcut` 可移除托管区块。
+
+systemd 用户服务会把 `WorkingDirectory` 和 `EnvironmentFile` 固定到
+`~/.config/opentyless`，并在 `install-service` 时把 `.env` 复制过去。
+安装完成后即使源码目录被移动或删除，登录自启动也不会因此失败。
 
 ### 方案二：手动安装
 
@@ -338,7 +346,7 @@ opentyless-rs tray
 ## Wayland 与 X11 说明
 
 - Wayland 下推荐把桌面快捷键绑定到 `toggle-record`，程序不依赖自己监听全局按键
-- Omarchy / Hyprland 下可使用安装器的 `--install-shortcut` 管理 Lua 快捷键配置；推荐使用 `SUPER + V`
+- Omarchy / Hyprland 下可使用安装器的 `--install-shortcut` 管理 Lua 快捷键配置；默认同时使用 `SUPER + V` 和 `CTRL + V`
 - X11 与 Wayland 共用同一套 daemon、service、tray 和转写主流程
 - 当前程序会优先根据 `XDG_SESSION_TYPE` 选择剪贴板默认值：
   - `wayland` 优先 `wl-copy`

@@ -12,6 +12,7 @@ INSTALL_TRAY=1
 INSTALL_SHORTCUT=0
 UNINSTALL_SHORTCUT=0
 SHORTCUT_BINDING=""
+SHORTCUT_BINDINGS=()
 FORCE_SHORTCUT=0
 SKIP_DEPS=0
 
@@ -37,9 +38,9 @@ usage() {
   --skip-deps           跳过系统依赖安装
   --no-service          不安装 systemd --user 服务
   --no-tray             不安装 GNOME 托盘自启动
-  --install-shortcut    安装 GNOME 快捷键
+  --install-shortcut    安装桌面快捷键
   --uninstall-shortcut  删除由 OpenTyless 管理的桌面快捷键后退出
-  --binding <keys>      快捷键绑定；Omarchy 默认 SUPER + V，GNOME 默认 <Super>v
+  --binding <keys>      快捷键绑定，可重复指定；Omarchy 默认 SUPER + V 与 CTRL + V，GNOME 默认 <Super>v
   --force               即使快捷键已被占用也覆盖（仅 Omarchy/Hyprland）
   -h, --help            显示帮助
 
@@ -81,6 +82,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --binding)
       [[ $# -ge 2 ]] || die "--binding 需要一个参数"
+      SHORTCUT_BINDINGS+=("$2")
       SHORTCUT_BINDING="$2"
       shift 2
       ;;
@@ -317,8 +319,9 @@ install_shortcut() {
   case "${CURRENT_DESKTOP}" in
     *Hyprland*|*hyprland*) install_hyprland_shortcut ;;
     *)
-      log "安装 GNOME 快捷键: ${SHORTCUT_BINDING}"
-      (cd "${PROJECT_ROOT}" && "${INSTALL_BIN_PATH}" install-gnome-shortcut --binding "${SHORTCUT_BINDING}")
+      local binding="${SHORTCUT_BINDINGS[0]:-${SHORTCUT_BINDING}}"
+      log "安装 GNOME 快捷键: ${binding}"
+      (cd "${PROJECT_ROOT}" && "${INSTALL_BIN_PATH}" install-gnome-shortcut --binding "${binding}")
       ;;
   esac
 }
@@ -346,33 +349,60 @@ backup_hyprland_bindings() {
   log "已备份 Hyprland 快捷键配置: ${backup_path}"
 }
 
+hyprland_shortcut_bindings() {
+  local bindings=()
+  if declare -p SHORTCUT_BINDINGS >/dev/null 2>&1 && [[ ${#SHORTCUT_BINDINGS[@]} -gt 0 ]]; then
+    bindings=("${SHORTCUT_BINDINGS[@]}")
+  elif [[ -n "${SHORTCUT_BINDING:-}" ]]; then
+    bindings+=("${SHORTCUT_BINDING}")
+  else
+    die "未指定快捷键绑定"
+  fi
+  printf '%s\n' "${bindings[@]}"
+}
+
 install_hyprland_shortcut() {
   local bindings_path
   bindings_path="$(hyprland_bindings_path)"
   [[ -f "${bindings_path}" ]] || die "未找到 Hyprland 快捷键配置: ${bindings_path}"
-  [[ "${SHORTCUT_BINDING}" =~ ^[A-Za-z0-9_+[:space:]-]+$ ]] || die "不支持的 Hyprland 快捷键格式: ${SHORTCUT_BINDING}"
 
-  local already_managed=0
-  grep -q '^-- BEGIN OPENTYLESS MANAGED SHORTCUT$' "${bindings_path}" && already_managed=1
-  if [[ ${already_managed} -eq 0 ]] && command -v omarchy >/dev/null 2>&1; then
-    if omarchy menu keybindings --print 2>/dev/null | awk -F '→' -v wanted="${SHORTCUT_BINDING}" '
-      { key=$1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", key); if (toupper(key) == toupper(wanted)) found=1 }
-      END { exit(found ? 0 : 1) }
-    '; then
-      [[ ${FORCE_SHORTCUT} -eq 1 ]] || die "快捷键 ${SHORTCUT_BINDING} 已被占用；请更换 --binding，或确认后使用 --force"
-      warn "将覆盖已经存在的快捷键: ${SHORTCUT_BINDING}"
-    fi
+  local bindings=()
+  local binding
+  while IFS= read -r binding; do
+    [[ -n "${binding}" ]] || continue
+    bindings+=("${binding}")
+  done < <(hyprland_shortcut_bindings)
+
+  for binding in "${bindings[@]}"; do
+    [[ "${binding}" =~ ^[A-Za-z0-9_+[:space:]-]+$ ]] || die "不支持的 Hyprland 快捷键格式: ${binding}"
+  done
+
+  if command -v omarchy >/dev/null 2>&1; then
+    for binding in "${bindings[@]}"; do
+      if grep -Fq "o.bind(\"${binding}\", \"OpenTyless voice input\"" "${bindings_path}"; then
+        continue
+      fi
+      if omarchy menu keybindings --print 2>/dev/null | awk -F '→' -v wanted="${binding}" '
+        { key=$1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", key); if (toupper(key) == toupper(wanted)) found=1 }
+        END { exit(found ? 0 : 1) }
+      '; then
+        [[ ${FORCE_SHORTCUT} -eq 1 ]] || die "快捷键 ${binding} 已被占用；请更换 --binding，或确认后使用 --force"
+        warn "将覆盖已经存在的快捷键: ${binding}"
+      fi
+    done
   fi
 
   backup_hyprland_bindings "${bindings_path}"
   remove_managed_hyprland_block "${bindings_path}"
   {
     printf '\n-- BEGIN OPENTYLESS MANAGED SHORTCUT\n'
-    printf 'hl.unbind("%s")\n' "${SHORTCUT_BINDING}"
-    printf 'o.bind("%s", "OpenTyless voice input", "%s")\n' "${SHORTCUT_BINDING}" "${HOTKEY_WRAPPER_PATH}"
+    for binding in "${bindings[@]}"; do
+      printf 'hl.unbind("%s")\n' "${binding}"
+      printf 'o.bind("%s", "OpenTyless voice input", "%s")\n' "${binding}" "${HOTKEY_WRAPPER_PATH}"
+    done
     printf '%s\n' '-- END OPENTYLESS MANAGED SHORTCUT'
   } >> "${bindings_path}"
-  log "已安装 Hyprland 快捷键: ${SHORTCUT_BINDING} -> ${HOTKEY_WRAPPER_PATH}"
+  log "已安装 Hyprland 快捷键: ${bindings[*]} -> ${HOTKEY_WRAPPER_PATH}"
 }
 
 uninstall_hyprland_shortcut() {
@@ -391,12 +421,13 @@ uninstall_hyprland_shortcut() {
 main() {
   log "检测到桌面会话: session=${SESSION_TYPE}, desktop=${CURRENT_DESKTOP}"
 
-  if [[ -z "${SHORTCUT_BINDING}" ]]; then
+  if [[ ${#SHORTCUT_BINDINGS[@]} -eq 0 ]]; then
     case "${CURRENT_DESKTOP}" in
-      *Hyprland*|*hyprland*) SHORTCUT_BINDING="SUPER + V" ;;
-      *) SHORTCUT_BINDING="<Super>v" ;;
+      *Hyprland*|*hyprland*) SHORTCUT_BINDINGS=("SUPER + V" "CTRL + V") ;;
+      *) SHORTCUT_BINDINGS=("<Super>v") ;;
     esac
   fi
+  SHORTCUT_BINDING="${SHORTCUT_BINDINGS[0]}"
 
   if [[ ${UNINSTALL_SHORTCUT} -eq 1 ]]; then
     case "${CURRENT_DESKTOP}" in
