@@ -120,6 +120,7 @@ let hotkeys = [
   HotkeyChoice(name: "⌃⌥Space", key: UInt32(kVK_Space), modifiers: UInt32(controlKey | optionKey)),
   HotkeyChoice(name: "⌃⇧Space", key: UInt32(kVK_Space), modifiers: UInt32(controlKey | shiftKey)),
   HotkeyChoice(name: "F8", key: UInt32(kVK_F8), modifiers: 0),
+  HotkeyChoice(name: "⌥Space", key: UInt32(kVK_Space), modifiers: UInt32(optionKey)),
 ]
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
