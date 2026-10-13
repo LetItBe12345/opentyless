@@ -620,6 +620,7 @@ impl Daemon {
 fn spawn_pipeline_job(config: Config, audio_path: PathBuf) {
     let state_path = config.state_path();
     thread::spawn(move || {
+        println!("{} pipeline started", Local::now().to_rfc3339());
         let result: Result<(String, String, PathBuf)> = (|| {
             config.validate_inference()?;
             let pipeline = Pipeline::new(config.clone())?;
@@ -637,11 +638,21 @@ fn spawn_pipeline_job(config: Config, audio_path: PathBuf) {
                 let copied = maybe_copy_to_clipboard(&config, &polished_text);
                 state.clipboard_copied = Some(config.auto_copy && copied.is_ok());
                 state.save(&state_path).ok();
+                println!(
+                    "{} pipeline completed; text_chars={}; clipboard_copied={}; output={}",
+                    Local::now().to_rfc3339(),
+                    polished_text.chars().count(),
+                    state.clipboard_copied.unwrap_or(false),
+                    output_path.display()
+                );
                 match copied {
                     Ok(()) => {
                         notify_event(&config, "OpenTyless", "转写成功").ok();
                     }
                     Err(error) => {
+                        state.error = Some(format!("转写成功，但复制到剪贴板失败：{error}"));
+                        state.save(&state_path).ok();
+                        eprintln!("clipboard copy failed: {error}");
                         notify_event(
                             &config,
                             "OpenTyless",
@@ -653,9 +664,16 @@ fn spawn_pipeline_job(config: Config, audio_path: PathBuf) {
             }
             Err(error) => {
                 state.last_event = Some("pipeline_failed".into());
-                state.error = Some(error.to_string());
+                let mut message = error.to_string();
+                for key in [&config.asr_api_key, &config.flash_api_key] {
+                    if !key.is_empty() {
+                        message = message.replace(key, "[REDACTED]");
+                    }
+                }
+                eprintln!("{} pipeline failed: {message}", Local::now().to_rfc3339());
+                state.error = Some(message.clone());
                 state.save(&state_path).ok();
-                notify_event(&config, "OpenTyless 错误", &error.to_string()).ok();
+                notify_event(&config, "OpenTyless 错误", &message).ok();
             }
         }
     });
@@ -1699,6 +1717,13 @@ fn maybe_copy_to_clipboard(config: &Config, text: &str) -> Result<()> {
 
 fn copy_to_clipboard(config: &Config, text: &str) -> Result<()> {
     let command = detect_clipboard_command(config).ok_or_else(|| anyhow!("未检测到剪贴板命令"))?;
+    #[cfg(target_os = "macos")]
+    if Path::new(&command[0])
+        .file_name()
+        .is_some_and(|name| name == "pbcopy")
+    {
+        return macos::copy_with_pbcopy(&command[0], &command[1..], text);
+    }
     // xclip and wl-copy both keep the clipboard buffer alive; never block the
     // transcription pipeline or tray action on them.
     spawn_command_with_stdin_detached(&command[0], &command[1..], text)

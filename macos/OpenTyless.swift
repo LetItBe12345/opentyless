@@ -235,10 +235,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       case "transcribing":
         showHUD("已停止录音，正在转写", "正在识别语音并整理文字…", symbol: "waveform", persistent: true)
       case "pipeline_completed":
-        showHUD(
-          "转写完成",
-          state["clipboard_copied"] as? Bool == true ? "已复制到剪贴板，按 ⌘V 粘贴" : "结果已保存，可从状态栏查看和复制",
-          symbol: "checkmark.circle.fill")
+        if lastError != nil {
+          showHUD("转写完成，但复制失败", "结果已保存，请从菜单重新复制或查看错误", symbol: "exclamationmark.triangle")
+        } else {
+          showHUD(
+            "转写完成",
+            state["clipboard_copied"] as? Bool == true ? "已复制到剪贴板，按 ⌘V 粘贴" : "结果已保存，可从状态栏查看和复制",
+            symbol: "checkmark.circle.fill")
+        }
       case "recording_cancelled": showHUD("已取消录音", "本次音频未发送转写", symbol: "xmark.circle")
       case "pipeline_failed", "command_failed":
         showHUD("处理未完成", "请从状态栏查看错误详情后重试", symbol: "exclamationmark.triangle")

@@ -73,6 +73,10 @@ fn render_agent(executable: &Path, config_dir: &Path, logs: &Path, tray: bool) -
             env.insert(name.into(), value.into());
         }
     }
+    // User LaunchAgents normally have no locale; keep Unicode consistent with
+    // interactive CLI invocations and with the pasteboard helper.
+    env.insert("LANG".into(), "en_US.UTF-8".into());
+    env.insert("LC_CTYPE".into(), "en_US.UTF-8".into());
     d.insert("EnvironmentVariables".into(), plist::Value::Dictionary(env));
     plist::Value::Dictionary(d)
 }
@@ -292,9 +296,83 @@ pub(super) fn shutdown_requested() -> bool {
     SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// launchd does not inherit the terminal's UTF-8 locale. Without it pbcopy
+/// can exit 0 while silently discarding non-ASCII text. Unlike wl-copy/xclip,
+/// pbcopy must finish before we report that the clipboard was updated.
+pub(super) fn copy_with_pbcopy(program: &str, args: &[String], text: &str) -> Result<()> {
+    let mut child = Command::new(program)
+        .args(args)
+        .env("LANG", "en_US.UTF-8")
+        .env("LC_ALL", "en_US.UTF-8")
+        .env("LC_CTYPE", "en_US.UTF-8")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("无法启动 pbcopy")?;
+    let written = child
+        .stdin
+        .take()
+        .context("pbcopy 标准输入不可用")?
+        .write_all(text.as_bytes());
+    if let Err(error) = written {
+        child.kill().ok();
+        child.wait().ok();
+        return Err(error).context("无法向 pbcopy 写入文字");
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if child.try_wait()?.is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().ok();
+            child.wait().ok();
+            bail!("pbcopy 超时，未确认剪贴板更新");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        bail!(
+            "pbcopy 退出失败（{}）：{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pbcopy_uses_utf8_waits_for_completion_and_reports_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("pbcopy");
+        let output = temp.path().join("copied.txt");
+        fs::write(&executable, format!("#!/bin/sh\n[ \"$LC_ALL\" = en_US.UTF-8 ] || exit 9\n/bin/sleep 0.1\n/bin/cat > '{}'\n", output.display())).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let text = "中文标点，测试。ABC 123 🐱";
+        copy_with_pbcopy(executable.to_str().unwrap(), &[], text).unwrap();
+        assert_eq!(
+            fs::read_to_string(output).unwrap(),
+            text,
+            "success must mean the process finished writing"
+        );
+        fs::write(
+            &executable,
+            "#!/bin/sh\n/bin/cat >/dev/null\necho pasteboard-unavailable >&2\nexit 23\n",
+        )
+        .unwrap();
+        let error = copy_with_pbcopy(executable.to_str().unwrap(), &[], text)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("23"));
+        assert!(error.contains("pasteboard-unavailable"));
+    }
+
     #[test]
     fn launch_agents_preserve_paths_and_quit_semantics() {
         let exe = Path::new("/Users/a b/OpenTyless.app/Contents/MacOS/opentyless-rs");

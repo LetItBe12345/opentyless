@@ -98,3 +98,7 @@ opentyless cancel-record
 - 合成中文语音通过真实阿里云 ASR → Flash 流程；原生麦克风约 3 秒测试也完成转写和 Markdown 输出。
 - 用户已确认从其他应用使用默认全局快捷键可以开始/停止。
 - Ubuntu 风格浮层为本地 AppKit 界面；不会调用系统通知授权，也不会把结果正文放入短提示。
+
+### 中文剪贴板与后台日志
+
+LaunchAgent 的环境可能没有 locale，macOS `pbcopy` 此时可能退出成功却丢弃中文。macOS 适配会为 `pbcopy` 显式设置 UTF-8，并等待实际退出；失败时记录错误且不显示“已复制”。Linux `wl-copy`/`xclip` 和自定义驻留剪贴板命令仍保持非阻塞。日志包含转写开始/结束、字符数和复制状态，不记录转写正文或 API Key。
