@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>OpenTyless</string>
+<key>CFBundleIdentifier</key><string>local.opentyless.app</string>
+<key>CFBundleName</key><string>OpenTyless</string>
+<key>CFBundleDisplayName</key><string>OpenTyless</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleShortVersionString</key><string>0.1.0</string>
+<key>CFBundleVersion</key><string>1</string>
+<key>LSUIElement</key><true/>
+<key>LSMinimumSystemVersion</key><string>13.0</string>
+<key>NSMicrophoneUsageDescription</key><string>录制你通过快捷键或菜单开始的语音，发送至你配置的语音识别服务。仅在你开始录音后使用麦克风。</string>
+<key>NSHighResolutionCapable</key><true/>
+</dict></plist>

@@ -13,6 +13,10 @@ It is built around:
 
 For release and publishing workflows, see [Release Guide](docs/RELEASE.md).
 
+## Native macOS app
+
+On macOS 13+, run `./scripts/install-macos.sh` (or `./install.sh`) to build and install a native menu bar app with global hotkeys, system microphone recording, clipboard copy, and launchd login startup. Set `DASHSCOPE_API_KEY` in `~/.config/opentyless/.env`. Press **Control + Option + Space** to start/stop, then **Command + V** to paste. Change hotkeys and login startup in the menu bar. See [macOS setup and verification](docs/MACOS.zh-CN.md). The GNOME/Hyprland/systemd instructions below apply to Linux.
+
 ## Release Model
 
 This repository now uses one main feature line and one release flow:
