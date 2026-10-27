@@ -297,6 +297,29 @@ opentyless-rs status
 - `opentyless-rs <command> --help`
   查看某个子命令的帮助和参数。
 
+## X11 鼠标侧键
+
+侧键 8 用于粘贴：Tilix、GNOME Terminal、Konsole、Kitty 等独立终端发送
+`Ctrl+Shift+V`，其他窗口发送 `Ctrl+V`。侧键 9 用于开始／停止录音。
+按窗口的 `WM_CLASS` 识别终端，不识别编辑器内嵌终端。
+
+编译和启用登录桌面后自启动（需要 GCC、X11 和 Xtst 开发库）：
+
+```bash
+mkdir -p ~/.local/bin ~/.config/systemd/user
+gcc -O2 -Wall -Wextra -Werror src/side-buttons.c -o ~/.local/bin/opentyless-side-buttons.new -lX11 -lXtst
+mv ~/.local/bin/opentyless-side-buttons.new ~/.local/bin/opentyless-side-buttons
+install -m 644 scripts/opentyless-side-buttons.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user reenable opentyless-side-buttons.service
+systemctl --user restart opentyless-side-buttons.service
+```
+
+需要先安装并启用 `opentyless.service`，且桌面会话已向用户级 systemd 提供
+`DISPLAY` 和 `XAUTHORITY`。仅支持 X11。
+
+录音通知会更新同一条通知，通知发送不阻塞录音命令；积压时只显示最新状态。
+
 ## 自启动与托盘
 
 安装并启用用户服务：

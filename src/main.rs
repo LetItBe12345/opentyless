@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{OnceLock, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -469,8 +470,8 @@ impl Daemon {
         self.state.last_event = Some("recording_started".into());
         self.state.error = None;
         self.state.save(&self.config.state_path())?;
-        notify_event(&self.config, "OpenTyless", "开始录音").ok();
         self.recorder = Some(recorder);
+        notify_event(&self.config, "OpenTyless", "开始录音").ok();
         Ok("已开始录音".into())
     }
 
@@ -1396,7 +1397,7 @@ fn render_service(_config: &Config) -> String {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("cargo run --release --"));
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     format!(
-        "[Unit]\nDescription=OpenTyless Rust daemon\nAfter=default.target\n\n[Service]\nType=simple\nWorkingDirectory={}\nEnvironmentFile={}\nExecStart={} daemon\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=OpenTyless Rust daemon\n\n[Service]\nType=simple\nWorkingDirectory={}\nEnvironmentFile={}\nExecStart={} daemon\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n",
         root.display(),
         root.join(".env").display(),
         exe.display(),
@@ -1541,10 +1542,57 @@ fn maybe_copy_to_clipboard(config: &Config, text: &str) -> Result<()> {
 }
 
 fn notify_event(config: &Config, summary: &str, body: &str) -> Result<()> {
-    if !config.enable_notifications || !command_exists("notify-send") {
+    if !config.enable_notifications {
         return Ok(());
     }
-    run_command("notify-send", &[summary, body])
+    // One worker preserves event order without blocking recording control on D-Bus.
+    // Reuse one notification so GNOME updates the banner instead of queuing old states.
+    static SENDER: OnceLock<mpsc::Sender<(String, String)>> = OnceLock::new();
+    let sender = SENDER.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel::<(String, String)>();
+        thread::spawn(move || {
+            let mut notification_id = String::from("0");
+            while let Ok(mut event) = receiver.recv() {
+                // If delivery was slow, display the newest state, not stale events.
+                while let Ok(newer) = receiver.try_recv() {
+                    event = newer;
+                }
+                let output = Command::new("notify-send")
+                    .args([
+                        "--app-name=OpenTyless",
+                        "--transient",
+                        "--expire-time=2000",
+                        "--hint=string:x-canonical-private-synchronous:opentyless",
+                        "--print-id",
+                        "--replace-id",
+                        &notification_id,
+                        "--",
+                        &event.0,
+                        &event.1,
+                    ])
+                    .output();
+                match output {
+                    Ok(output) if output.status.success() => {
+                        if let Ok(id) = String::from_utf8_lossy(&output.stdout)
+                            .trim()
+                            .parse::<u32>()
+                        {
+                            notification_id = id.to_string();
+                        }
+                    }
+                    Ok(output) => eprintln!(
+                        "发送通知失败：{}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ),
+                    Err(error) => eprintln!("发送通知失败：{error}"),
+                }
+            }
+        });
+        sender
+    });
+    sender
+        .send((summary.to_owned(), body.to_owned()))
+        .map_err(|error| anyhow!("通知线程已停止：{error}"))
 }
 
 fn detect_clipboard_command(config: &Config) -> Option<Vec<String>> {
@@ -2305,6 +2353,7 @@ mod tests {
         let unit = render_service(&config);
         assert!(unit.contains("Restart=always"));
         assert!(unit.contains("daemon"));
+        assert!(!unit.contains("After=default.target"));
     }
 
     #[test]

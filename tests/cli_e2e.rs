@@ -8,6 +8,81 @@ use std::time::{Duration, Instant};
 
 use tempfile::tempdir;
 
+#[test]
+fn slow_notifications_do_not_block_recording_and_replace_the_previous_banner() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixStream;
+
+    struct DaemonGuard(std::process::Child);
+    impl Drop for DaemonGuard {
+        fn drop(&mut self) {
+            self.0.kill().ok();
+            self.0.wait().ok();
+        }
+    }
+
+    let temp = tempdir().unwrap();
+    let recorder = temp.path().join("recorder");
+    let notifier = temp.path().join("notify-send");
+    let calls = temp.path().join("notifications");
+    fs::write(&recorder, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    fs::write(
+        &notifier,
+        "#!/bin/sh\nprintf '%s\\n' BEGIN \"$@\" END >> \"$NOTIFICATION_LOG\"\nsleep 2\nprintf '42\\n'\n",
+    )
+    .unwrap();
+    for path in [&recorder, &notifier] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let socket = temp.path().join("run/opentyless.sock");
+    let _daemon = DaemonGuard(
+        Command::new(env!("CARGO_BIN_EXE_opentyless-rs"))
+            .arg("daemon")
+            .env("RUN_DIR", temp.path().join("run"))
+            .env("STATE_DIR", temp.path().join("state"))
+            .env("SOCKET_PATH", &socket)
+            .env("RECORDER_CMD", &recorder)
+            .env("ENABLE_NOTIFICATIONS", "true")
+            .env("NOTIFICATION_LOG", &calls)
+            .env("PATH", format!("{}:/usr/bin:/bin", temp.path().display()))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_for(&socket);
+
+    let send = |action: &str| {
+        let mut stream = UnixStream::connect(&socket).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        writeln!(stream, "{{\"action\":\"{action}\"}}").unwrap();
+        let mut response = String::new();
+        BufReader::new(stream).read_line(&mut response).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["ok"], true, "{response}");
+    };
+    send("start-record");
+    wait_for(&calls); // The notification worker is now sleeping for two seconds.
+    send("cancel-record"); // Must return before the slow notifier finishes.
+
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        let log = fs::read_to_string(&calls).unwrap();
+        if log.contains("已取消录音") {
+            assert!(log.contains("开始录音"));
+            assert!(log.contains("--replace-id\n42\n"), "{log}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "missing replacement notification: {log}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn handle_connection(mut stream: TcpStream) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut headers = String::new();
@@ -132,6 +207,7 @@ fn daemon_cli_flow_works_with_mock_server() {
         .env("ASR_API_KEY", "test")
         .env("FLASH_API_KEY", "test")
         .env("AUTO_COPY_TO_CLIPBOARD", "false")
+        .env("ENABLE_NOTIFICATIONS", "false")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -243,6 +319,7 @@ fn toggle_record_flow_works_with_mock_server() {
         .env("ASR_API_KEY", "test")
         .env("FLASH_API_KEY", "test")
         .env("AUTO_COPY_TO_CLIPBOARD", "false")
+        .env("ENABLE_NOTIFICATIONS", "false")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -300,6 +377,16 @@ fn debug_exe() -> PathBuf {
         .join("target/debug/opentyless-rs")
 }
 
+fn mock_systemctl(temp: &Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = temp.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let systemctl = bin.join("systemctl");
+    fs::write(&systemctl, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    format!("{}:/usr/bin:/bin", bin.display())
+}
+
 #[test]
 fn install_tray_service_writes_unit_file() {
     let temp = tempdir().unwrap();
@@ -310,6 +397,7 @@ fn install_tray_service_writes_unit_file() {
 
     let output = Command::new(debug_exe())
         .arg("install-tray-service")
+        .env("PATH", mock_systemctl(temp.path()))
         .env("HOME", &fake_home)
         .env("ASR_API_KEY", "test")
         .env("FLASH_API_KEY", "test")
@@ -344,6 +432,7 @@ fn uninstall_tray_service_removes_unit_file() {
 
     let output = Command::new(debug_exe())
         .arg("uninstall-tray-service")
+        .env("PATH", mock_systemctl(temp.path()))
         .env("HOME", &fake_home)
         .env("ASR_API_KEY", "test")
         .env("FLASH_API_KEY", "test")

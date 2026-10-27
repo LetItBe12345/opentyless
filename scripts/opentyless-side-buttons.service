@@ -1,0 +1,14 @@
+[Unit]
+Description=OpenTyless mouse side-button bindings
+After=graphical-session.target opentyless.service
+PartOf=graphical-session.target
+Wants=opentyless.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/opentyless-side-buttons
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
