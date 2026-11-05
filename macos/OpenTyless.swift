@@ -1,5 +1,6 @@
 import AVFoundation
 import AppKit
+import ApplicationServices
 import Carbon
 
 // A small native shell; the Rust CLI remains the only transcription pipeline.
@@ -136,6 +137,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   var hudHide: DispatchWorkItem?
   var hotkey: EventHotKeyRef?
   var handler: EventHandlerRef?
+  let mouseShortcuts = MouseShortcuts()
+  var mouseShortcutError: String?
+  var mouseShortcutsEnabled: Bool {
+    preferences.object(forKey: "mouseShortcutsEnabled") as? Bool ?? true
+  }
+  var mouseShortcutStatus: String {
+    if !mouseShortcutsEnabled { return "已关闭" }
+    if !AXIsProcessTrusted() { return "请授权辅助功能" }
+    return mouseShortcutError ?? (mouseShortcuts.isRunning ? "上侧键录音 / 下侧键粘贴" : "正在连接")
+  }
   var selected = 0
   var busy = false
   var menuTracking = false
@@ -186,6 +197,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     } else {
       hotkeyError = "快捷键事件监听失败（\(handlerCode)）"
     }
+    mouseShortcuts.swapped = preferences.bool(forKey: "mouseButtonsSwapped")
+    mouseShortcuts.onAction = { [weak self] action in
+      // Keep the event-tap callback short; never run CLI or display UI in it.
+      DispatchQueue.main.async {
+        guard let self, self.mouseShortcutsEnabled else { return }
+        switch action {
+        case .toggleRecording: self.toggle()
+        case .paste: self.pasteClipboard()
+        }
+      }
+    }
     DispatchQueue.global(qos: .utility).async { _ = runCLI(["start"]) }
     refresh()
     if !preferences.bool(forKey: "hasLaunched") {
@@ -214,6 +236,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
   }
   func refresh() {
+    updateMouseShortcuts()
     var state: [String: Any] = [:]
     if let data = try? Data(contentsOf: stateURL()),
       let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -241,7 +264,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
           showHUD(
             "转写完成",
-            state["clipboard_copied"] as? Bool == true ? "已复制到剪贴板，按 ⌘V 粘贴" : "结果已保存，可从状态栏查看和复制",
+            state["clipboard_copied"] as? Bool == true ? "已复制，按鼠标下侧键或 ⌘V 粘贴" : "结果已保存，可从状态栏查看和复制",
             symbol: "checkmark.circle.fill")
         }
       case "recording_cancelled": showHUD("已取消录音", "本次音频未发送转写", symbol: "xmark.circle")
@@ -257,7 +280,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       : recording
         ? "正在录音，再按快捷键停止" : transcribing ? "正在转写和整理…" : lastError != nil ? "处理出错，点击查看详情" : "就绪"
     let fingerprint =
-      "\(latestText)|\(statusText)|\(lastError ?? "")|\(selected)|\(hotkeyError ?? "")|\(loginEnabled)|\(busy)|\(settingsWindow != nil)|\(apiConfigured)"
+      "\(latestText)|\(statusText)|\(lastError ?? "")|\(selected)|\(hotkeyError ?? "")|\(loginEnabled)|\(busy)|\(settingsWindow != nil)|\(apiConfigured)|\(mouseShortcutStatus)|\(mouseShortcuts.swapped)"
     guard fingerprint != renderedState else { return }
     if !menuTracking { renderedState = fingerprint }
     item.button?.title = recording ? " ●" : transcribing ? " …" : ""
@@ -266,14 +289,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       accessibilityDescription: "OpenTyless：\(statusText)")
     item.button?.image?.isTemplate = true
     item.button?.toolTip =
-      "OpenTyless：\(statusText)\n快捷键：\(hotkeys[selected].name)"
+      "OpenTyless：\(statusText)\n快捷键：\(hotkeys[selected].name)\n鼠标侧键：\(mouseShortcutStatus)"
       + (latestText.isEmpty ? "" : "\n最近结果：" + String(latestText.prefix(60)))
     let hint =
       apiConfigured
-      ? "按快捷键开始录音，再按一次停止并转写。\n完成提示会说明结果是否已复制。\n从状态栏可查看最近结果和错误详情。"
+      ? "按快捷键或鼠标上侧键开始录音，再按一次停止并转写。\n转写完成后，按鼠标下侧键或 ⌘V 粘贴。\n侧键方向相反时，可从状态栏菜单交换上下侧键。"
       : "请先编辑 API 配置，填写 DASHSCOPE_API_KEY，\n再从状态栏选择「重新加载配置」。"
     settingsLabel?.stringValue =
-      "后台：\(statusText)\n全局快捷键：\(hotkeys[selected].name)（\(hotkey == nil ? "未注册" : "已注册")）\n登录自启动：\(loginEnabled ? "已开启" : "已关闭")\nAPI 配置：\(apiConfigured ? "已填写" : "待填写")\n\n"
+      "后台：\(statusText)\n全局快捷键：\(hotkeys[selected].name)（\(hotkey == nil ? "未注册" : "已注册")）\n鼠标侧键：\(mouseShortcutStatus)\n登录自启动：\(loginEnabled ? "已开启" : "已关闭")\nAPI 配置：\(apiConfigured ? "已填写" : "待填写")\n\n"
       + hint
     if item.menu == nil || !menuTracking { buildMenu() }
   }
@@ -312,6 +335,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       entry.state = selected == index && hotkey != nil ? .on : .off
     }
     shortcut.submenu = submenu
+    let mouse = add(menu, "鼠标侧键：\(mouseShortcutStatus)", nil)
+    let mouseMenu = NSMenu()
+    mouseMenu.autoenablesItems = false
+    let enabled = add(mouseMenu, "启用侧键：上侧录音，下侧粘贴", #selector(toggleMouseShortcuts))
+    enabled.state = mouseShortcutsEnabled ? .on : .off
+    let swap = add(mouseMenu, "交换上下侧键", #selector(swapMouseButtons))
+    swap.state = mouseShortcuts.swapped ? .on : .off
+    _ = add(mouseMenu, "授权辅助功能…", #selector(mousePermission))
+    mouse.submenu = mouseMenu
     let login = add(
       menu, "登录时自动启动", #selector(toggleLogin), enabled: !busy && !recording && !transcribing)
     login.state = loginEnabled ? .on : .off
@@ -325,6 +357,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   }
   func menuWillOpen(_ menu: NSMenu) { menuTracking = true }
   func menuDidClose(_ menu: NSMenu) { menuTracking = false }
+  func updateMouseShortcuts() {
+    guard mouseShortcutsEnabled && AXIsProcessTrusted() else {
+      mouseShortcuts.stop()
+      mouseShortcutError = nil
+      return
+    }
+    if !mouseShortcuts.isRunning {
+      mouseShortcutError = mouseShortcuts.start() ? nil : "监听失败，请检查辅助功能权限"
+    }
+  }
+  @objc func toggleMouseShortcuts() {
+    preferences.set(!mouseShortcutsEnabled, forKey: "mouseShortcutsEnabled")
+    refresh()
+    if mouseShortcutsEnabled && !AXIsProcessTrusted() { mousePermission() }
+  }
+  @objc func swapMouseButtons() {
+    mouseShortcuts.swapped.toggle()
+    preferences.set(mouseShortcuts.swapped, forKey: "mouseButtonsSwapped")
+    refresh()
+  }
+  @objc func mousePermission() {
+    let options =
+      [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+    _ = AXIsProcessTrustedWithOptions(options)
+    NSWorkspace.shared.open(
+      URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+  }
+  func pasteClipboard() {
+    guard AXIsProcessTrusted() else {
+      mousePermission()
+      return
+    }
+    // Paste the existing clipboard into the focused application, exactly as ⌘V.
+    // Do not activate OpenTyless or replace the clipboard with an older result.
+    for event in MouseShortcuts.pasteEvents() { event.post(tap: .cgSessionEventTap) }
+  }
   func alert(_ title: String, _ body: String) {
     NSApp.activate(ignoringOtherApps: true)
     let alert = NSAlert()
@@ -386,25 +454,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   @objc func showSettings() {
     if settingsWindow == nil {
       let window = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: 480, height: 285), styleMask: [.titled, .closable],
+        contentRect: NSRect(x: 0, y: 0, width: 540, height: 340), styleMask: [.titled, .closable],
         backing: .buffered, defer: false)
       window.title = "OpenTyless · 设置与状态"
       window.isReleasedWhenClosed = false
       let label = NSTextField(wrappingLabelWithString: "")
-      label.frame = NSRect(x: 24, y: 80, width: 430, height: 180)
+      label.frame = NSRect(x: 24, y: 80, width: 492, height: 235)
       label.font = NSFont.systemFont(ofSize: 14)
       window.contentView?.addSubview(label)
       settingsLabel = label
       let config = NSButton(title: "编辑 API 配置", target: self, action: #selector(openConfig))
-      config.frame = NSRect(x: 24, y: 24, width: 140, height: 32)
+      config.frame = NSRect(x: 24, y: 24, width: 110, height: 32)
       config.bezelStyle = .rounded
       window.contentView?.addSubview(config)
       let permission = NSButton(title: "麦克风权限", target: self, action: #selector(microphone))
-      permission.frame = NSRect(x: 180, y: 24, width: 130, height: 32)
+      permission.frame = NSRect(x: 150, y: 24, width: 110, height: 32)
       permission.bezelStyle = .rounded
       window.contentView?.addSubview(permission)
+      let mouse = NSButton(title: "鼠标侧键权限", target: self, action: #selector(mousePermission))
+      mouse.frame = NSRect(x: 276, y: 24, width: 110, height: 32)
+      mouse.bezelStyle = .rounded
+      window.contentView?.addSubview(mouse)
       let status = NSButton(title: "状态栏菜单", target: self, action: #selector(showMenu))
-      status.frame = NSRect(x: 320, y: 24, width: 135, height: 32)
+      status.frame = NSRect(x: 402, y: 24, width: 110, height: 32)
       status.bezelStyle = .rounded
       window.contentView?.addSubview(status)
       window.center()
@@ -421,7 +493,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
   }
   @objc func copyLast() {
-    perform(["copy-last"]) { self.showHUD("复制成功", "按 ⌘V 粘贴最近的转写结果", symbol: "doc.on.clipboard") }
+    perform(["copy-last"]) { self.showHUD("复制成功", "按鼠标下侧键或 ⌘V 粘贴", symbol: "doc.on.clipboard") }
   }
   @objc func cancel() {
     // Cancel is exposed by the daemon socket; keep the same public CLI on both platforms.
@@ -586,18 +658,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   }
   @objc func quit() { perform(["stop"]) { NSApp.terminate(nil) } }
   func applicationWillTerminate(_ notification: Notification) {
+    mouseShortcuts.stop()
     if let hotkey { UnregisterEventHotKey(hotkey) }
     if let handler { RemoveEventHandler(handler) }
   }
 }
 
-if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--record" {
-  let session = RecorderSession()
-  session.start(path: CommandLine.arguments[2])
-  withExtendedLifetime(session) { RunLoop.main.run() }
-} else {
-  let app = NSApplication.shared
-  let delegate = AppDelegate()
-  app.delegate = delegate
-  withExtendedLifetime(delegate) { app.run() }
+@main
+enum OpenTyless {
+  static func main() {
+    if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--record" {
+      let session = RecorderSession()
+      session.start(path: CommandLine.arguments[2])
+      withExtendedLifetime(session) { RunLoop.main.run() }
+    } else {
+      let app = NSApplication.shared
+      let delegate = AppDelegate()
+      app.delegate = delegate
+      withExtendedLifetime(delegate) { app.run() }
+    }
+  }
 }
