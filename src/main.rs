@@ -12,17 +12,16 @@ use base64::Engine;
 use chrono::Local;
 use clap::{Args, Parser, Subcommand};
 
-#[cfg(target_os = "linux")]
 use ksni::blocking::TrayMethods;
-#[cfg(target_os = "macos")]
-mod macos;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 #[derive(Parser)]
 #[command(name = "opentyless-rs")]
-#[command(about = "Rust 语音转写 CLI，支持 Linux 桌面和 macOS 状态栏")]
+#[command(
+    about = "面向 Linux 桌面工作流的 Rust 语音转写 CLI：由系统快捷键触发命令，而非监听全局按键"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -33,19 +32,10 @@ enum Commands {
     Daemon,
     StartRecord,
     StopRecord,
-    CancelRecord,
     ToggleRecord,
     Status,
     Once(OnceArgs),
-    /// Transcribe an existing recording without changing the clipboard or daemon state.
-    TranscribeFile {
-        audio: PathBuf,
-        #[arg(long)]
-        raw_only: bool,
-    },
     Doctor,
-    /// Validate ASR and cleanup credentials without recording or making network requests.
-    CheckConfig,
     InstallService(InstallServiceArgs),
     InstallGnomeShortcut(GnomeShortcutArgs),
     InstallTrayAutostart,
@@ -101,8 +91,6 @@ struct Config {
     flash_model: String,
     recorder_cmd: Option<String>,
     asr_extra_form: Value,
-    asr_vocabulary: Value,
-    asr_context: String,
     flash_extra_body: Value,
     flash_prompt: String,
     auto_copy: bool,
@@ -139,8 +127,6 @@ impl Config {
             flash_model: env_var("FLASH_MODEL", "qwen-flash"),
             recorder_cmd: env_optional("RECORDER_CMD"),
             asr_extra_form: json_env("ASR_EXTRA_FORM_JSON")?,
-            asr_vocabulary: load_asr_vocabulary(env_optional("ASR_VOCABULARY_FILE").as_deref())?,
-            asr_context: env_var("ASR_CONTEXT", ""),
             flash_extra_body: json_env("FLASH_EXTRA_BODY_JSON")?,
             flash_prompt: env_var(
                 "FLASH_PROMPT",
@@ -179,22 +165,7 @@ impl Config {
         self.state_dir.join("status.json")
     }
 
-    fn uses_native_asr(&self) -> bool {
-        matches!(
-            self.asr_model.as_str(),
-            "qwen-audio-3.1-asr-flash" | "qwen-audio-3.0-asr-flash"
-        )
-    }
-
     fn asr_url(&self) -> String {
-        if self.asr_api_url.is_empty() && self.uses_native_asr() {
-            return format!(
-                "{}/api/v1/services/aigc/multimodal-generation/generation",
-                self.dashscope_base_url
-                    .trim_end_matches('/')
-                    .trim_end_matches("/compatible-mode/v1")
-            );
-        }
         if self.asr_api_url.is_empty() {
             format!(
                 "{}/chat/completions",
@@ -228,7 +199,6 @@ struct State {
     last_event: Option<String>,
     last_raw_text: Option<String>,
     last_polished_text: Option<String>,
-    clipboard_copied: Option<bool>,
     last_output_path: Option<String>,
     error: Option<String>,
 }
@@ -265,45 +235,11 @@ impl Recorder {
         ));
         let mut command = detect_recorder_command(config)?;
         command.arg(&audio_path);
-        // A CLI started by a shell/service may inherit SIGINT as ignored.
-        // Restore it in the recorder child so stop() can finalize its WAV.
-        #[cfg(unix)]
-        unsafe {
-            use std::os::unix::process::CommandExt;
-            command.pre_exec(|| {
-                libc::signal(libc::SIGINT, libc::SIG_DFL);
-                libc::signal(libc::SIGTERM, libc::SIG_DFL);
-                Ok(())
-            });
-        }
         let child = command
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .context("启动录音进程失败")?;
-        #[cfg(target_os = "macos")]
-        let mut child = child;
-        #[cfg(target_os = "macos")]
-        if config.recorder_cmd.is_none() {
-            let ready = PathBuf::from(format!("{}.ready", audio_path.display()));
-            let error = PathBuf::from(format!("{}.error", audio_path.display()));
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
-            while !ready.exists() {
-                if let Some(status) = child.try_wait()? {
-                    let reason = fs::read_to_string(&error)
-                        .unwrap_or_else(|_| format!("录音进程退出: {status}"));
-                    fs::remove_file(&error).ok();
-                    bail!("{reason}");
-                }
-                if std::time::Instant::now() >= deadline {
-                    child.kill().ok();
-                    child.wait().ok();
-                    bail!("麦克风启动超时，请先在 OpenTyless 状态栏菜单中授权麦克风");
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
-            fs::remove_file(ready).ok();
-        }
         Ok(Self { child, audio_path })
     }
 
@@ -354,7 +290,7 @@ impl QwenClient {
             .send()?
             .error_for_status()?
             .json()?;
-        extract_asr_text(&payload).ok_or_else(|| anyhow!("ASR 返回中未找到文本: {payload}"))
+        extract_text(&payload).ok_or_else(|| anyhow!("ASR 返回中未找到文本: {payload}"))
     }
 
     fn polish_text(&self, raw_text: &str) -> Result<String> {
@@ -475,16 +411,7 @@ impl Daemon {
             "daemon 已启动，socket: {}",
             self.config.socket_path.display()
         );
-        #[cfg(target_os = "macos")]
-        {
-            macos::install_shutdown_handlers()?;
-            listener.set_nonblocking(true)?;
-        }
         for stream in listener.incoming() {
-            #[cfg(target_os = "macos")]
-            if macos::shutdown_requested() {
-                break;
-            }
             match stream {
                 Ok(stream) => {
                     if let Err(error) = self.handle_stream(stream) {
@@ -493,33 +420,12 @@ impl Daemon {
                         self.state.save(&self.config.state_path()).ok();
                     }
                 }
-                #[cfg(target_os = "macos")]
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(50));
-                }
                 Err(error) => {
                     self.state.error = Some(error.to_string());
                     self.state.last_event = Some("socket_error".into());
                     self.state.save(&self.config.state_path()).ok();
                 }
             }
-        }
-        #[cfg(target_os = "macos")]
-        {
-            if let Some(path) = self
-                .recorder
-                .take()
-                .and_then(|recorder| recorder.stop().ok())
-            {
-                fs::remove_file(path).ok();
-            }
-            self.state.recording = false;
-            self.state.recorder_pid = None;
-            self.state.pid = None;
-            self.state.last_event = Some("daemon_stopped".into());
-            self.state.save(&self.config.state_path())?;
-            fs::remove_file(self.config.pid_path()).ok();
-            fs::remove_file(&self.config.socket_path).ok();
         }
         Ok(())
     }
@@ -530,9 +436,6 @@ impl Daemon {
         stream.set_write_timeout(timeout)?;
         let mut input = String::new();
         BufReader::new(stream.try_clone()?).read_line(&mut input)?;
-        if input.trim().is_empty() {
-            return Ok(());
-        }
         let request: Request = serde_json::from_str(input.trim())?;
         let response = self.handle_action(&request.action);
         stream.write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())?;
@@ -645,7 +548,6 @@ impl Daemon {
 fn spawn_pipeline_job(config: Config, audio_path: PathBuf) {
     let state_path = config.state_path();
     thread::spawn(move || {
-        println!("{} pipeline started", Local::now().to_rfc3339());
         let result: Result<(String, String, PathBuf)> = (|| {
             config.validate_inference()?;
             let pipeline = Pipeline::new(config.clone())?;
@@ -660,24 +562,12 @@ fn spawn_pipeline_job(config: Config, audio_path: PathBuf) {
                 state.last_polished_text = Some(polished_text.clone());
                 state.last_output_path = Some(output_path.display().to_string());
                 state.error = None;
-                let copied = maybe_copy_to_clipboard(&config, &polished_text);
-                state.clipboard_copied = Some(config.auto_copy && copied.is_ok());
                 state.save(&state_path).ok();
-                println!(
-                    "{} pipeline completed; text_chars={}; clipboard_copied={}; output={}",
-                    Local::now().to_rfc3339(),
-                    polished_text.chars().count(),
-                    state.clipboard_copied.unwrap_or(false),
-                    output_path.display()
-                );
-                match copied {
+                match maybe_copy_to_clipboard(&config, &polished_text) {
                     Ok(()) => {
                         notify_event(&config, "OpenTyless", "转写成功").ok();
                     }
                     Err(error) => {
-                        state.error = Some(format!("转写成功，但复制到剪贴板失败：{error}"));
-                        state.save(&state_path).ok();
-                        eprintln!("clipboard copy failed: {error}");
                         notify_event(
                             &config,
                             "OpenTyless",
@@ -689,16 +579,9 @@ fn spawn_pipeline_job(config: Config, audio_path: PathBuf) {
             }
             Err(error) => {
                 state.last_event = Some("pipeline_failed".into());
-                let mut message = error.to_string();
-                for key in [&config.asr_api_key, &config.flash_api_key] {
-                    if !key.is_empty() {
-                        message = message.replace(key, "[REDACTED]");
-                    }
-                }
-                eprintln!("{} pipeline failed: {message}", Local::now().to_rfc3339());
-                state.error = Some(message.clone());
+                state.error = Some(error.to_string());
                 state.save(&state_path).ok();
-                notify_event(&config, "OpenTyless 错误", &message).ok();
+                notify_event(&config, "OpenTyless 错误", &error.to_string()).ok();
             }
         }
     });
@@ -707,33 +590,14 @@ fn spawn_pipeline_job(config: Config, audio_path: PathBuf) {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = Config::load()?;
-    #[cfg(target_os = "macos")]
-    if let Some(result) = macos::handle_command(&cli.command, &config) {
-        return result;
-    }
     match cli.command {
         Commands::Daemon => cmd_daemon(config),
         Commands::StartRecord => cmd_send(&config, "start-record"),
         Commands::StopRecord => cmd_send(&config, "stop-record"),
-        Commands::CancelRecord => cmd_send(&config, "cancel-record"),
         Commands::ToggleRecord => cmd_send(&config, "toggle-record"),
         Commands::Status => cmd_status(&config),
         Commands::Once(args) => cmd_once(config, args.seconds),
-        Commands::TranscribeFile { audio, raw_only } => {
-            config.validate_inference()?;
-            ensure_audio_has_signal(&audio)?;
-            let client = QwenClient::new(config)?;
-            let raw = client.speech_to_text(&audio)?;
-            let polished = if raw_only {
-                None
-            } else {
-                Some(client.polish_text(&raw)?)
-            };
-            println!("{}", json!({"raw": raw, "polished": polished}));
-            Ok(())
-        }
         Commands::Doctor => cmd_doctor(&config),
-        Commands::CheckConfig => config.validate_inference(),
         Commands::InstallService(args) => cmd_install_service(&config, args.enable),
         Commands::InstallGnomeShortcut(args) => cmd_install_gnome_shortcut(args),
         Commands::InstallTrayAutostart => cmd_install_tray_autostart(),
@@ -817,11 +681,6 @@ fn cmd_doctor(config: &Config) -> Result<()> {
             .unwrap_or(false);
         println!("{}: {}", name, if is_set { "已设置" } else { "未设置" });
     }
-    println!("ASR model: {}", config.asr_model);
-    println!(
-        "ASR vocabulary terms: {}",
-        config.asr_vocabulary.as_object().map_or(0, |v| v.len())
-    );
     println!("ASR effective url: {}", config.asr_url());
     println!("Flash effective url: {}", config.flash_url());
     println!("RUN_DIR: {}", config.run_dir.display());
@@ -1006,7 +865,6 @@ fn cmd_logs(unit: &str, lines: usize) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 fn cmd_tray(config: Config) -> Result<()> {
     let handle = OpenTylessTray::new(config).spawn()?;
     loop {
@@ -1015,15 +873,10 @@ fn cmd_tray(config: Config) -> Result<()> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn cmd_tray(_config: Config) -> Result<()> {
-    bail!("此平台请使用 macOS 应用状态栏")
-}
-
 fn send_request(socket_path: &Path, request: &Request) -> Result<Response> {
     let mut stream = UnixStream::connect(socket_path)
         .with_context(|| format!("无法连接 daemon，请先运行 `opentyless-rs daemon` 或 `install-service --enable`。socket={}", socket_path.display()))?;
-    let timeout = Some(Duration::from_secs(35));
+    let timeout = Some(Duration::from_secs(5));
     stream.set_read_timeout(timeout)?;
     stream.set_write_timeout(timeout)?;
     stream.write_all(format!("{}\n", serde_json::to_string(request)?).as_bytes())?;
@@ -1043,136 +896,53 @@ fn detect_recorder_command(config: &Config) -> Result<Command> {
         return Ok(command);
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        let mut command = Command::new(macos::helper_path()?);
-        command.arg("--record");
-        Ok(command)
+    if command_exists("ffmpeg") {
+        let mut command = Command::new("ffmpeg");
+        command.args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "pulse",
+            "-i",
+            "default",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+        ]);
+        return Ok(command);
     }
 
-    #[cfg(not(target_os = "macos"))]
-    {
-        if command_exists("ffmpeg") {
-            let mut command = Command::new("ffmpeg");
-            command.args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-f",
-                "pulse",
-                "-i",
-                "default",
-                "-ac",
-                "1",
-                "-ar",
-                "16000",
-            ]);
-            return Ok(command);
-        }
-
-        if command_exists("arecord") {
-            let mut command = Command::new("arecord");
-            command.args(["-f", "S16_LE", "-r", "16000", "-c", "1"]);
-            return Ok(command);
-        }
-
-        bail!("未找到录音命令，请安装 ffmpeg 或 arecord，或设置 RECORDER_CMD")
+    if command_exists("arecord") {
+        let mut command = Command::new("arecord");
+        command.args(["-f", "S16_LE", "-r", "16000", "-c", "1"]);
+        return Ok(command);
     }
+
+    bail!("未找到录音命令，请安装 ffmpeg 或 arecord，或设置 RECORDER_CMD")
 }
 
 fn detect_recorder_preview(config: &Config) -> Result<String> {
     if let Some(custom) = &config.recorder_cmd {
         return Ok(custom.clone());
     }
-    #[cfg(target_os = "macos")]
-    return Ok(format!(
-        "{} --record <output.wav>",
-        macos::helper_path()?.display()
-    ));
-    #[cfg(not(target_os = "macos"))]
-    {
-        if command_exists("ffmpeg") {
-            return Ok(
+    if command_exists("ffmpeg") {
+        return Ok(
             "ffmpeg -hide_banner -loglevel error -f pulse -i default -ac 1 -ar 16000 <output.wav>"
                 .into(),
         );
-        }
-        if command_exists("arecord") {
-            return Ok("arecord -f S16_LE -r 16000 -c 1 <output.wav>".into());
-        }
-        bail!("未找到录音命令")
     }
-}
-
-fn load_asr_vocabulary(path: Option<&str>) -> Result<Value> {
-    let Some(path) = path else {
-        return Ok(json!({}));
-    };
-    let value: Value = serde_json::from_str(
-        &fs::read_to_string(path).with_context(|| format!("无法读取术语表: {path}"))?,
-    )?;
-    let terms = value
-        .as_object()
-        .ok_or_else(|| anyhow!("术语表必须为词语到权重的 JSON 对象"))?;
-    if terms.len() > 2000 {
-        bail!("术语表不能超过 2000 个词");
+    if command_exists("arecord") {
+        return Ok("arecord -f S16_LE -r 16000 -c 1 <output.wav>".into());
     }
-    for (term, weight) in terms {
-        if term.trim().is_empty()
-            || term.chars().count() > 80
-            || term.chars().any(char::is_control)
-            || !matches!(weight.as_u64(), Some(1..=5))
-        {
-            bail!("术语表包含无效词条或权重（只允许 1–5）");
-        }
-    }
-    Ok(value)
-}
-
-// Native ASR can wrap output twice and return a sentence or a complete sentence list.
-fn extract_asr_text(value: &Value) -> Option<String> {
-    if let Some(text) = value
-        .get("text")
-        .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty())
-    {
-        return Some(text.trim().to_string());
-    }
-    if let Some(sentences) = value.get("sentences").and_then(Value::as_array) {
-        let texts: Vec<_> = sentences.iter().filter_map(extract_asr_text).collect();
-        if !texts.is_empty() {
-            return Some(texts.join(""));
-        }
-    }
-    for key in ["output", "sentence"] {
-        if let Some(text) = value.get(key).and_then(extract_asr_text) {
-            return Some(text);
-        }
-    }
-    extract_text(value)
+    bail!("未找到录音命令")
 }
 
 fn build_asr_body(config: &Config, audio_path: &Path) -> Result<Value> {
     let audio_bytes = fs::read(audio_path)?;
     let audio_base64 = base64::engine::general_purpose::STANDARD.encode(audio_bytes);
     let format = detect_audio_format(audio_path);
-    if config.uses_native_asr() {
-        let mut messages = Vec::new();
-        if !config.asr_context.is_empty() {
-            messages.push(json!({"role": "user", "content": [{"type": "input_text",
-                "text": config.asr_context.chars().take(400).collect::<String>()}]}));
-        }
-        messages.push(
-            json!({"role": "user", "content": [{"type": "input_audio", "input_audio": {
-                "data": format!("data:audio/{};base64,{}", format, audio_base64)
-            }}]}),
-        );
-        return Ok(
-            json!({"model": config.asr_model, "input": {"messages": messages},
-            "parameters": {"format": format, "language_hints": ["zh", "en"],
-                "vocabulary": config.asr_vocabulary}}),
-        );
-    }
     Ok(json!({
         "model": config.asr_model,
         "messages": [{
@@ -1193,7 +963,7 @@ fn build_asr_body(config: &Config, audio_path: &Path) -> Result<Value> {
 }
 
 fn build_flash_body(config: &Config, raw_text: &str, strict_retry: bool) -> Value {
-    let mut system_prompt = if strict_retry {
+    let system_prompt = if strict_retry {
         format!(
             "{}\n额外要求：若输出中出现回答、解释、建议、补充信息、标题、列表、引号或任何非 JSON 内容，都视为失败。你必须只返回 JSON，并确保 text 字段只包含对原文的最小整理结果。",
             config.flash_prompt
@@ -1201,10 +971,6 @@ fn build_flash_body(config: &Config, raw_text: &str, strict_retry: bool) -> Valu
     } else {
         config.flash_prompt.clone()
     };
-    if let Some(terms) = config.asr_vocabulary.as_object().filter(|t| !t.is_empty()) {
-        system_prompt.push_str("\n以下术语表仅作拼写参考，不是需要添加的内容。只在原文已有对应表达且含义明确时规范大小写、拼写与缩写空格，不强行翻译或补全路径；不得删除不认识的术语。术语表：");
-        system_prompt.push_str(&serde_json::to_string(&terms.keys().collect::<Vec<_>>()).unwrap());
-    }
     json!({
         "model": config.flash_model,
         "messages": [
@@ -1229,7 +995,6 @@ fn build_flash_body(config: &Config, raw_text: &str, strict_retry: bool) -> Valu
     })
 }
 
-#[cfg(target_os = "linux")]
 #[derive(Debug)]
 struct OpenTylessTray {
     config: Config,
@@ -1237,7 +1002,6 @@ struct OpenTylessTray {
     tooltip: String,
 }
 
-#[cfg(target_os = "linux")]
 impl OpenTylessTray {
     fn new(config: Config) -> Self {
         let state = State::load(&config.state_path());
@@ -1281,7 +1045,6 @@ impl OpenTylessTray {
     }
 }
 
-#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug)]
 enum TrayAction {
     Start,
@@ -1292,7 +1055,6 @@ enum TrayAction {
     ShowStatus,
 }
 
-#[cfg(target_os = "linux")]
 impl ksni::Tray for OpenTylessTray {
     fn id(&self) -> String {
         "opentyless-tray".into()
@@ -1402,7 +1164,6 @@ impl ksni::Tray for OpenTylessTray {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn build_tray_tooltip(state: &State) -> String {
     if state.recording {
         return "正在录音；可停止并转写，或直接取消本次录音。".into();
@@ -1413,7 +1174,6 @@ fn build_tray_tooltip(state: &State) -> String {
     "待命中；可从快捷键或托盘开始录音。".into()
 }
 
-#[cfg(target_os = "linux")]
 fn truncate_text(text: &str, max_chars: usize) -> String {
     let mut result = String::new();
     for (index, ch) in text.chars().enumerate() {
@@ -1505,8 +1265,7 @@ fn wav_peak_amplitude(audio_path: &Path) -> Result<Option<i32>> {
     };
 
     let peak = data
-        .chunks(2)
-        .filter(|sample| sample.len() == 2)
+        .chunks_exact(2)
         .map(|sample| i16::from_le_bytes([sample[0], sample[1]]) as i32)
         .map(i32::abs)
         .max()
@@ -1798,12 +1557,13 @@ fn find_or_create_gnome_binding_path(paths: &mut Vec<String>, name: &str) -> Str
             "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:{}",
             path
         );
-        if Command::new("gsettings")
+        if let Ok(output) = Command::new("gsettings")
             .args(["get", &schema, "name"])
             .output()
-            .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains(name))
         {
-            return path.clone();
+            if String::from_utf8_lossy(&output.stdout).contains(name) {
+                return path.clone();
+            }
         }
     }
     let mut index = 0;
@@ -1828,14 +1588,8 @@ fn maybe_copy_to_clipboard(config: &Config, text: &str) -> Result<()> {
 }
 
 fn copy_to_clipboard(config: &Config, text: &str) -> Result<()> {
-    let command = detect_clipboard_command(config).ok_or_else(|| anyhow!("未检测到剪贴板命令"))?;
-    #[cfg(target_os = "macos")]
-    if Path::new(&command[0])
-        .file_name()
-        .is_some_and(|name| name == "pbcopy")
-    {
-        return macos::copy_with_pbcopy(&command[0], &command[1..], text);
-    }
+    let command = detect_clipboard_command(config)
+        .ok_or_else(|| anyhow!("未检测到剪贴板命令"))?;
     // xclip and wl-copy both keep the clipboard buffer alive; never block the
     // transcription pipeline or tray action on them.
     spawn_command_with_stdin_detached(&command[0], &command[1..], text)
@@ -1855,13 +1609,12 @@ fn detect_clipboard_command(config: &Config) -> Option<Vec<String>> {
             return Some(parts);
         }
     }
-    #[cfg(target_os = "macos")]
-    if command_exists("pbcopy") {
-        return Some(vec!["pbcopy".into()]);
+    for candidate in clipboard_command_candidates(current_session_type().as_deref()) {
+        if command_exists(&candidate[0]) {
+            return Some(candidate);
+        }
     }
-    clipboard_command_candidates(current_session_type().as_deref())
-        .into_iter()
-        .find(|candidate| command_exists(&candidate[0]))
+    None
 }
 
 fn clipboard_command_candidates(session_type: Option<&str>) -> Vec<Vec<String>> {
@@ -2085,7 +1838,6 @@ fn process_running_with_name(pid_path: &Path, expected_name: Option<&str>) -> bo
         .unwrap_or(false)
 }
 
-#[cfg(not(target_os = "macos"))]
 fn pid_matches_expected_process(pid: u32, expected_name: Option<&str>) -> bool {
     let proc_dir = PathBuf::from(format!("/proc/{pid}"));
     if !proc_dir.exists() {
@@ -2113,27 +1865,6 @@ fn pid_matches_expected_process(pid: u32, expected_name: Option<&str>) -> bool {
         .unwrap_or(false);
 
     exe_matches || cmdline_matches
-}
-
-#[cfg(target_os = "macos")]
-fn pid_matches_expected_process(pid: u32, expected_name: Option<&str>) -> bool {
-    if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
-        return false;
-    }
-    let Some(expected) = expected_name else {
-        return true;
-    };
-    Command::new("/bin/ps")
-        .args(["-p", &pid.to_string(), "-o", "comm="])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| {
-            Path::new(String::from_utf8_lossy(&o.stdout).trim())
-                .file_name()
-                .is_some_and(|n| n == expected)
-        })
-        .unwrap_or(false)
 }
 
 fn daemon_running(config: &Config) -> bool {
@@ -2180,10 +1911,7 @@ fn cleanup_empty_recordings(run_dir: &Path) {
         if !name.starts_with("recording_") || !name.ends_with(".wav") {
             continue;
         }
-        if fs::metadata(&path)
-            .map(|meta| meta.len() == 0)
-            .unwrap_or(false)
-        {
+        if fs::metadata(&path).map(|meta| meta.len() == 0).unwrap_or(false) {
             fs::remove_file(&path).ok();
         }
     }
@@ -2276,10 +2004,11 @@ fn load_env_files() {
 
 fn ensure_installed_env_file() -> Result<PathBuf> {
     let dir = installed_config_dir();
-    fs::create_dir_all(&dir).with_context(|| format!("无法创建配置目录: {}", dir.display()))?;
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("无法创建配置目录: {}", dir.display()))?;
     let dest = installed_env_path();
     let cwd_env = PathBuf::from(".env");
-    if cwd_env.is_file() && fs::canonicalize(&cwd_env).ok() != fs::canonicalize(&dest).ok() {
+    if cwd_env.is_file() {
         fs::copy(&cwd_env, &dest)
             .with_context(|| format!("无法写入环境文件: {}", dest.display()))?;
     }
@@ -2315,8 +2044,6 @@ mod tests {
             flash_model: "qwen-flash".into(),
             recorder_cmd: None,
             asr_extra_form: json!({}),
-            asr_vocabulary: json!({}),
-            asr_context: String::new(),
             flash_extra_body: json!({}),
             flash_prompt: "整理一下".into(),
             auto_copy: false,
@@ -2374,90 +2101,6 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(data.starts_with("data:audio/wav;base64,"));
-    }
-
-    #[test]
-    fn native_asr_request_preserves_audio_and_uses_vocabulary() {
-        let temp = tempdir().unwrap();
-        let wav = temp.path().join("sample.wav");
-        fs::write(&wav, b"audio bytes").unwrap();
-        let mut config = sample_config();
-        config.asr_model = "qwen-audio-3.1-asr-flash".into();
-        config.asr_vocabulary = json!({"Codex": 4, "持久化": 3});
-        config.asr_context = "计算机".repeat(200);
-        let body = build_asr_body(&config, &wav).unwrap();
-        assert_eq!(body["parameters"]["vocabulary"], config.asr_vocabulary);
-        assert_eq!(body["parameters"]["language_hints"], json!(["zh", "en"]));
-        assert_eq!(
-            body["input"]["messages"][0]["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .chars()
-                .count(),
-            400
-        );
-        let data = body["input"]["messages"][1]["content"][0]["input_audio"]["data"]
-            .as_str()
-            .unwrap();
-        assert_eq!(
-            base64::engine::general_purpose::STANDARD
-                .decode(data.split(',').nth(1).unwrap())
-                .unwrap(),
-            b"audio bytes"
-        );
-        assert!(
-            config
-                .asr_url()
-                .ends_with("/api/v1/services/aigc/multimodal-generation/generation")
-        );
-        config.asr_api_url = "https://custom.invalid/asr".into();
-        assert_eq!(config.asr_url(), config.asr_api_url);
-        let cleanup = build_flash_body(&config, "Codex 持久化", false);
-        assert!(
-            cleanup["messages"][0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("Codex")
-        );
-    }
-
-    #[test]
-    fn native_asr_extracts_all_sentences_and_nested_output() {
-        assert_eq!(
-            extract_asr_text(&json!({"output":{"output":{"sentence":{"text":"Codex"}}}}))
-                .as_deref(),
-            Some("Codex")
-        );
-        assert_eq!(
-            extract_asr_text(
-                &json!({"output":{"sentences":[{"text":"前端。"},{"text":"后端。"}]}})
-            )
-            .as_deref(),
-            Some("前端。后端。")
-        );
-        assert_eq!(
-            extract_asr_text(&json!({"output":{"text":"完整文本", "sentence":{"text":"片段"}}}))
-                .as_deref(),
-            Some("完整文本")
-        );
-        assert!(extract_asr_text(&json!({"code":"InvalidParameter"})).is_none());
-    }
-
-    #[test]
-    fn vocabulary_rejects_invalid_weights_and_shapes() {
-        let temp = tempdir().unwrap();
-        let file = temp.path().join("terms.json");
-        for invalid in [
-            json!(["Codex"]),
-            json!({"Codex":50}),
-            json!({"":4}),
-            json!({"Codex":"4"}),
-        ] {
-            fs::write(&file, invalid.to_string()).unwrap();
-            assert!(load_asr_vocabulary(file.to_str()).is_err());
-        }
-        fs::write(&file, r#"{"Codex":4,"持久化":3}"#).unwrap();
-        assert_eq!(load_asr_vocabulary(file.to_str()).unwrap()["Codex"], 4);
     }
 
     #[test]

@@ -1,14 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "$(uname -s)" == Darwin ]]; then
-  if [[ $# -gt 0 ]]; then
-    echo 'macOS: use ./scripts/install-macos.sh (Linux installer flags do not apply)' >&2
-    exit 1
-  fi
-  exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/install-macos.sh"
-fi
-
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_BIN_DIR="${HOME}/.local/bin"
 INSTALL_BIN_PATH="${INSTALL_BIN_DIR}/opentyless-rs"
