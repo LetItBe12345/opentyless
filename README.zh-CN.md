@@ -13,6 +13,10 @@ OpenTyless 是一个面向桌面工作流的轻量 Rust 语音转写 CLI。它�
 
 发布和打包流程见 [发布指南](docs/RELEASE.zh-CN.md)。
 
+## macOS 原生版
+
+macOS 13+ 现可使用原生状态栏、全局快捷键、系统麦克风和 launchd 登录自启动。运行 `./scripts/install-macos.sh`（或 `./install.sh`），填写 `~/.config/opentyless/.env` 中的 `DASHSCOPE_API_KEY`。默认 **Control + Option + Space** 切换录音，完成后 **Command + V** 粘贴。允许辅助功能权限后，也可用**鼠标上侧键**单击开始、再单击停止并转写，**下侧键**粘贴。快捷键、侧键方向及自启动可在状态栏菜单中设置。完整安装、迁移和测试说明见 [macOS 适配](docs/MACOS.zh-CN.md)。原有 GNOME、Hyprland、systemd 安装方式适用于 Linux。
+
 ## 发布方式
 
 当前仓库采用一套主功能、一套发布逻辑：

@@ -83,7 +83,14 @@ fn handle_connection(mut stream: TcpStream, behavior: MockBehavior) {
     }
 
     let request_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let response_body = if body_str.contains("qwen3-asr-flash") {
+    let response_body = if body_str.contains("qwen-audio-3.1-asr-flash") {
+        assert!(request_body["input"]["messages"].is_array());
+        assert_eq!(
+            request_body["parameters"]["language_hints"],
+            serde_json::json!(["zh", "en"])
+        );
+        r#"{"output":{"output":{"sentence":{"text":"测试语音原文"}}}}"#
+    } else if body_str.contains("qwen3-asr-flash") {
         r#"{"choices":[{"message":{"content":[{"type":"text","text":"测试语音原文"}]}}]}"#
     } else {
         assert_eq!(request_body["response_format"]["type"], "json_object");
@@ -102,7 +109,10 @@ fn handle_connection(mut stream: TcpStream, behavior: MockBehavior) {
     stream.write_all(response.as_bytes()).unwrap();
 }
 
-fn spawn_mock_server(behavior: MockBehavior, connections: usize) -> (String, thread::JoinHandle<()>) {
+fn spawn_mock_server(
+    behavior: MockBehavior,
+    connections: usize,
+) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let server = thread::spawn(move || {
@@ -128,14 +138,18 @@ fn wait_for(path: &Path) {
 fn wait_for_state_audio(path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if let Ok(content) = fs::read_to_string(path) {
-            if let Ok(state) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(audio_path) = state.get("audio_path").and_then(|v| v.as_str()) {
-                    if Path::new(audio_path).exists() {
-                        return;
-                    }
-                }
-            }
+        let ready = fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|state| {
+                state
+                    .get("audio_path")
+                    .and_then(|v| v.as_str())
+                    .map(PathBuf::from)
+            })
+            .is_some_and(|audio| audio.exists());
+        if ready {
+            return;
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -198,21 +212,16 @@ impl Harness {
     }
 
     fn empty_recorder(&self) {
-        self.write_recorder("#!/usr/bin/env bash\ntrap 'exit 0' INT\nwhile true; do sleep 0.1; done\n");
+        self.write_recorder(
+            "#!/usr/bin/env bash\ntrap 'exit 0' INT\nwhile true; do sleep 0.1; done\n",
+        );
     }
 
     fn sigint_recorder(&self, flag_path: &Path) {
         self.write_recorder(&format!(
-            "#!/usr/bin/env bash\nout=\"$1\"\ntrap 'cp \"{}\" \"$out\"; echo interrupted > \"{}\"; exit 0' INT\nwhile true; do sleep 0.1; done\n",
+            "#!/usr/bin/env bash\nout=\"$1\"\ntrap 'cp \"{}\" \"$out\"; echo interrupted > \"{}\"; exit 0' INT\necho ready > \"$out.ready\"\nwhile true; do sleep 0.1; done\n",
             self.fixture.display(),
             flag_path.display()
-        ));
-    }
-
-    fn once_recorder(&self) {
-        self.write_recorder(&format!(
-            "#!/usr/bin/env bash\ncp '{}' \"$1\"\nexec sleep 30\n",
-            self.fixture.display()
         ));
     }
 
@@ -237,7 +246,9 @@ impl Harness {
             .env("ASR_API_KEY", "test")
             .env("FLASH_API_KEY", "test")
             .stdout(Stdio::null())
-            .stderr(Stdio::from(fs::File::create(self.run_dir.join("daemon.err")).unwrap()))
+            .stderr(Stdio::from(
+                fs::File::create(self.run_dir.join("daemon.err")).unwrap(),
+            ))
             .spawn()
             .unwrap()
     }
@@ -414,10 +425,13 @@ fn toggle_record_flow_works_with_mock_server() {
 #[test]
 fn once_cli_flow_works_with_mock_server() {
     let harness = Harness::new();
-    harness.once_recorder();
     let (addr, server) = spawn_mock_server(MockBehavior::Success, 2);
     let output = harness
         .base_command(&["once", "--seconds", "1"])
+        .env(
+            "RECORDER_CMD",
+            format!("/bin/cp {}", harness.fixture.display()),
+        )
         .env("ASR_API_URL", format!("http://{addr}/chat/completions"))
         .env("FLASH_API_URL", format!("http://{addr}/chat/completions"))
         .env("ASR_API_KEY", "test")
@@ -558,7 +572,9 @@ fn cancel_record_discards_audio_without_pipeline() {
     let status = wait_for_event(&harness.status_path(), "recording_cancelled");
     assert!(!audio_path.exists());
     assert!(!status.contains("pipeline_completed"));
-    assert!(!harness.output_dir.exists() || fs::read_dir(&harness.output_dir).unwrap().next().is_none());
+    assert!(
+        !harness.output_dir.exists() || fs::read_dir(&harness.output_dir).unwrap().next().is_none()
+    );
 
     kill_daemon(daemon);
     drop(server);
@@ -614,7 +630,12 @@ fn recorder_stop_sends_sigint_so_wav_can_be_finalized() {
     let start = harness.run(&["start-record"]);
     assert_success(&start);
     wait_for_event(&harness.status_path(), "recording_started");
-    thread::sleep(Duration::from_millis(150));
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(harness.status_path()).unwrap()).unwrap();
+    wait_for(Path::new(&format!(
+        "{}.ready",
+        state["audio_path"].as_str().unwrap()
+    )));
 
     let stop = harness.run_with_keys(&["stop-record"]);
     assert_success(&stop);
@@ -647,6 +668,7 @@ fn pipeline_failure_sets_error_state() {
     server.join().unwrap();
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn install_tray_autostart_writes_desktop_file() {
     let harness = Harness::new();
@@ -665,6 +687,7 @@ fn install_tray_autostart_writes_desktop_file() {
     assert!(content.contains("tray"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn install_tray_service_writes_unit_file() {
     let temp = tempdir().unwrap();
@@ -697,8 +720,7 @@ fn install_tray_service_writes_unit_file() {
     assert!(content.contains("tray"));
     assert!(content.contains("graphical-session.target"));
     assert!(
-        content.contains("EnvironmentFile=-")
-            && content.contains(".config/opentyless/.env"),
+        content.contains("EnvironmentFile=-") && content.contains(".config/opentyless/.env"),
         "unit should pin an optional XDG env file: {content}"
     );
     assert!(
@@ -707,6 +729,7 @@ fn install_tray_service_writes_unit_file() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn uninstall_tray_service_removes_unit_file() {
     let temp = tempdir().unwrap();
@@ -748,4 +771,93 @@ fn hyprland_shortcut_install_is_idempotent_and_uninstallable() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_service_install_preserves_existing_env_and_writes_launch_agent() {
+    let temp = tempdir().unwrap();
+    let config = temp.path().join(".config/opentyless");
+    fs::create_dir_all(&config).unwrap();
+    let env_file = config.join(".env");
+    let original = "DASHSCOPE_API_KEY='test-sentinel'\n";
+    fs::write(&env_file, original).unwrap();
+    let output = Command::new(debug_exe())
+        .arg("install-service")
+        .current_dir(&config)
+        .env("HOME", temp.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert_eq!(fs::read_to_string(env_file).unwrap(), original);
+    let agent = fs::read_to_string(
+        temp.path()
+            .join("Library/LaunchAgents/local.opentyless.daemon.plist"),
+    )
+    .unwrap();
+    assert!(agent.contains("RunAtLoad"));
+    assert!(agent.contains("KeepAlive"));
+    assert!(agent.contains(config.to_str().unwrap()));
+    assert!(!agent.contains("systemctl"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn daemon_sigterm_stops_the_microphone_child_and_removes_socket() {
+    let harness = Harness::new();
+    harness.looping_recorder();
+    let mut daemon = harness.spawn_daemon("127.0.0.1:1");
+    wait_for(&harness.socket_path);
+    assert_success(&harness.run(&["start-record"]));
+    wait_for_state_audio(&harness.status_path());
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(harness.status_path()).unwrap()).unwrap();
+    let recorder_pid = state["recorder_pid"].as_u64().unwrap() as i32;
+    unsafe {
+        libc::kill(daemon.id() as i32, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while daemon.try_wait().unwrap().is_none() {
+        if Instant::now() > deadline {
+            daemon.kill().ok();
+            panic!("daemon did not exit gracefully");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        unsafe { libc::kill(recorder_pid, 0) },
+        -1,
+        "recorder must not outlive daemon"
+    );
+    assert!(!harness.socket_path.exists());
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(harness.status_path()).unwrap()).unwrap();
+    assert_eq!(state["recording"], false);
+    assert_eq!(state["last_event"], "daemon_stopped");
+}
+
+#[test]
+fn native_asr_file_transcription_uses_both_stages_without_daemon_state() {
+    let harness = Harness::new();
+    let (addr, server) = spawn_mock_server(MockBehavior::Success, 2);
+    let output = harness
+        .base_command(&["transcribe-file", harness.fixture.to_str().unwrap()])
+        .env("ASR_MODEL", "qwen-audio-3.1-asr-flash")
+        .env("ASR_API_URL", format!("http://{addr}/native-asr"))
+        .env("FLASH_API_URL", format!("http://{addr}/chat/completions"))
+        .env("ASR_API_KEY", "test")
+        .env("FLASH_API_KEY", "test")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["raw"], "测试语音原文");
+    assert_eq!(response["polished"], "测试语音整理后");
+    assert!(!harness.state_dir.join("status.json").exists());
+    server.join().unwrap();
 }

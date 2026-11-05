@@ -1,0 +1,1 @@
+软件开发术语：TUI（Text User Interface，终端文本界面）、CLI（Command Line Interface，命令行接口）、PR（Pull Request，拉取请求）、CI（Continuous Integration，持续集成）、CD（Continuous Delivery，持续交付）。这些英文缩写通常按字母逐个读出。
