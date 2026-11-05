@@ -37,6 +37,12 @@ enum Commands {
     ToggleRecord,
     Status,
     Once(OnceArgs),
+    /// Transcribe an existing recording without changing the clipboard or daemon state.
+    TranscribeFile {
+        audio: PathBuf,
+        #[arg(long)]
+        raw_only: bool,
+    },
     Doctor,
     /// Validate ASR and cleanup credentials without recording or making network requests.
     CheckConfig,
@@ -95,6 +101,8 @@ struct Config {
     flash_model: String,
     recorder_cmd: Option<String>,
     asr_extra_form: Value,
+    asr_vocabulary: Value,
+    asr_context: String,
     flash_extra_body: Value,
     flash_prompt: String,
     auto_copy: bool,
@@ -131,6 +139,8 @@ impl Config {
             flash_model: env_var("FLASH_MODEL", "qwen-flash"),
             recorder_cmd: env_optional("RECORDER_CMD"),
             asr_extra_form: json_env("ASR_EXTRA_FORM_JSON")?,
+            asr_vocabulary: load_asr_vocabulary(env_optional("ASR_VOCABULARY_FILE").as_deref())?,
+            asr_context: env_var("ASR_CONTEXT", ""),
             flash_extra_body: json_env("FLASH_EXTRA_BODY_JSON")?,
             flash_prompt: env_var(
                 "FLASH_PROMPT",
@@ -169,7 +179,22 @@ impl Config {
         self.state_dir.join("status.json")
     }
 
+    fn uses_native_asr(&self) -> bool {
+        matches!(
+            self.asr_model.as_str(),
+            "qwen-audio-3.1-asr-flash" | "qwen-audio-3.0-asr-flash"
+        )
+    }
+
     fn asr_url(&self) -> String {
+        if self.asr_api_url.is_empty() && self.uses_native_asr() {
+            return format!(
+                "{}/api/v1/services/aigc/multimodal-generation/generation",
+                self.dashscope_base_url
+                    .trim_end_matches('/')
+                    .trim_end_matches("/compatible-mode/v1")
+            );
+        }
         if self.asr_api_url.is_empty() {
             format!(
                 "{}/chat/completions",
@@ -329,7 +354,7 @@ impl QwenClient {
             .send()?
             .error_for_status()?
             .json()?;
-        extract_text(&payload).ok_or_else(|| anyhow!("ASR 返回中未找到文本: {payload}"))
+        extract_asr_text(&payload).ok_or_else(|| anyhow!("ASR 返回中未找到文本: {payload}"))
     }
 
     fn polish_text(&self, raw_text: &str) -> Result<String> {
@@ -694,6 +719,19 @@ fn main() -> Result<()> {
         Commands::ToggleRecord => cmd_send(&config, "toggle-record"),
         Commands::Status => cmd_status(&config),
         Commands::Once(args) => cmd_once(config, args.seconds),
+        Commands::TranscribeFile { audio, raw_only } => {
+            config.validate_inference()?;
+            ensure_audio_has_signal(&audio)?;
+            let client = QwenClient::new(config)?;
+            let raw = client.speech_to_text(&audio)?;
+            let polished = if raw_only {
+                None
+            } else {
+                Some(client.polish_text(&raw)?)
+            };
+            println!("{}", json!({"raw": raw, "polished": polished}));
+            Ok(())
+        }
         Commands::Doctor => cmd_doctor(&config),
         Commands::CheckConfig => config.validate_inference(),
         Commands::InstallService(args) => cmd_install_service(&config, args.enable),
@@ -779,6 +817,11 @@ fn cmd_doctor(config: &Config) -> Result<()> {
             .unwrap_or(false);
         println!("{}: {}", name, if is_set { "已设置" } else { "未设置" });
     }
+    println!("ASR model: {}", config.asr_model);
+    println!(
+        "ASR vocabulary terms: {}",
+        config.asr_vocabulary.as_object().map_or(0, |v| v.len())
+    );
     println!("ASR effective url: {}", config.asr_url());
     println!("Flash effective url: {}", config.flash_url());
     println!("RUN_DIR: {}", config.run_dir.display());
@@ -1061,10 +1104,75 @@ fn detect_recorder_preview(config: &Config) -> Result<String> {
     }
 }
 
+fn load_asr_vocabulary(path: Option<&str>) -> Result<Value> {
+    let Some(path) = path else {
+        return Ok(json!({}));
+    };
+    let value: Value = serde_json::from_str(
+        &fs::read_to_string(path).with_context(|| format!("无法读取术语表: {path}"))?,
+    )?;
+    let terms = value
+        .as_object()
+        .ok_or_else(|| anyhow!("术语表必须为词语到权重的 JSON 对象"))?;
+    if terms.len() > 2000 {
+        bail!("术语表不能超过 2000 个词");
+    }
+    for (term, weight) in terms {
+        if term.trim().is_empty()
+            || term.chars().count() > 80
+            || term.chars().any(char::is_control)
+            || !matches!(weight.as_u64(), Some(1..=5))
+        {
+            bail!("术语表包含无效词条或权重（只允许 1–5）");
+        }
+    }
+    Ok(value)
+}
+
+// Native ASR can wrap output twice and return a sentence or a complete sentence list.
+fn extract_asr_text(value: &Value) -> Option<String> {
+    if let Some(text) = value
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    {
+        return Some(text.trim().to_string());
+    }
+    if let Some(sentences) = value.get("sentences").and_then(Value::as_array) {
+        let texts: Vec<_> = sentences.iter().filter_map(extract_asr_text).collect();
+        if !texts.is_empty() {
+            return Some(texts.join(""));
+        }
+    }
+    for key in ["output", "sentence"] {
+        if let Some(text) = value.get(key).and_then(extract_asr_text) {
+            return Some(text);
+        }
+    }
+    extract_text(value)
+}
+
 fn build_asr_body(config: &Config, audio_path: &Path) -> Result<Value> {
     let audio_bytes = fs::read(audio_path)?;
     let audio_base64 = base64::engine::general_purpose::STANDARD.encode(audio_bytes);
     let format = detect_audio_format(audio_path);
+    if config.uses_native_asr() {
+        let mut messages = Vec::new();
+        if !config.asr_context.is_empty() {
+            messages.push(json!({"role": "user", "content": [{"type": "input_text",
+                "text": config.asr_context.chars().take(400).collect::<String>()}]}));
+        }
+        messages.push(
+            json!({"role": "user", "content": [{"type": "input_audio", "input_audio": {
+                "data": format!("data:audio/{};base64,{}", format, audio_base64)
+            }}]}),
+        );
+        return Ok(
+            json!({"model": config.asr_model, "input": {"messages": messages},
+            "parameters": {"format": format, "language_hints": ["zh", "en"],
+                "vocabulary": config.asr_vocabulary}}),
+        );
+    }
     Ok(json!({
         "model": config.asr_model,
         "messages": [{
@@ -1085,7 +1193,7 @@ fn build_asr_body(config: &Config, audio_path: &Path) -> Result<Value> {
 }
 
 fn build_flash_body(config: &Config, raw_text: &str, strict_retry: bool) -> Value {
-    let system_prompt = if strict_retry {
+    let mut system_prompt = if strict_retry {
         format!(
             "{}\n额外要求：若输出中出现回答、解释、建议、补充信息、标题、列表、引号或任何非 JSON 内容，都视为失败。你必须只返回 JSON，并确保 text 字段只包含对原文的最小整理结果。",
             config.flash_prompt
@@ -1093,6 +1201,10 @@ fn build_flash_body(config: &Config, raw_text: &str, strict_retry: bool) -> Valu
     } else {
         config.flash_prompt.clone()
     };
+    if let Some(terms) = config.asr_vocabulary.as_object().filter(|t| !t.is_empty()) {
+        system_prompt.push_str("\n以下术语表仅作拼写参考，不是需要添加的内容。只在原文已有对应表达且含义明确时规范大小写、拼写与缩写空格，不强行翻译或补全路径；不得删除不认识的术语。术语表：");
+        system_prompt.push_str(&serde_json::to_string(&terms.keys().collect::<Vec<_>>()).unwrap());
+    }
     json!({
         "model": config.flash_model,
         "messages": [
@@ -2203,6 +2315,8 @@ mod tests {
             flash_model: "qwen-flash".into(),
             recorder_cmd: None,
             asr_extra_form: json!({}),
+            asr_vocabulary: json!({}),
+            asr_context: String::new(),
             flash_extra_body: json!({}),
             flash_prompt: "整理一下".into(),
             auto_copy: false,
@@ -2260,6 +2374,90 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(data.starts_with("data:audio/wav;base64,"));
+    }
+
+    #[test]
+    fn native_asr_request_preserves_audio_and_uses_vocabulary() {
+        let temp = tempdir().unwrap();
+        let wav = temp.path().join("sample.wav");
+        fs::write(&wav, b"audio bytes").unwrap();
+        let mut config = sample_config();
+        config.asr_model = "qwen-audio-3.1-asr-flash".into();
+        config.asr_vocabulary = json!({"Codex": 4, "持久化": 3});
+        config.asr_context = "计算机".repeat(200);
+        let body = build_asr_body(&config, &wav).unwrap();
+        assert_eq!(body["parameters"]["vocabulary"], config.asr_vocabulary);
+        assert_eq!(body["parameters"]["language_hints"], json!(["zh", "en"]));
+        assert_eq!(
+            body["input"]["messages"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            400
+        );
+        let data = body["input"]["messages"][1]["content"][0]["input_audio"]["data"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(data.split(',').nth(1).unwrap())
+                .unwrap(),
+            b"audio bytes"
+        );
+        assert!(
+            config
+                .asr_url()
+                .ends_with("/api/v1/services/aigc/multimodal-generation/generation")
+        );
+        config.asr_api_url = "https://custom.invalid/asr".into();
+        assert_eq!(config.asr_url(), config.asr_api_url);
+        let cleanup = build_flash_body(&config, "Codex 持久化", false);
+        assert!(
+            cleanup["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Codex")
+        );
+    }
+
+    #[test]
+    fn native_asr_extracts_all_sentences_and_nested_output() {
+        assert_eq!(
+            extract_asr_text(&json!({"output":{"output":{"sentence":{"text":"Codex"}}}}))
+                .as_deref(),
+            Some("Codex")
+        );
+        assert_eq!(
+            extract_asr_text(
+                &json!({"output":{"sentences":[{"text":"前端。"},{"text":"后端。"}]}})
+            )
+            .as_deref(),
+            Some("前端。后端。")
+        );
+        assert_eq!(
+            extract_asr_text(&json!({"output":{"text":"完整文本", "sentence":{"text":"片段"}}}))
+                .as_deref(),
+            Some("完整文本")
+        );
+        assert!(extract_asr_text(&json!({"code":"InvalidParameter"})).is_none());
+    }
+
+    #[test]
+    fn vocabulary_rejects_invalid_weights_and_shapes() {
+        let temp = tempdir().unwrap();
+        let file = temp.path().join("terms.json");
+        for invalid in [
+            json!(["Codex"]),
+            json!({"Codex":50}),
+            json!({"":4}),
+            json!({"Codex":"4"}),
+        ] {
+            fs::write(&file, invalid.to_string()).unwrap();
+            assert!(load_asr_vocabulary(file.to_str()).is_err());
+        }
+        fs::write(&file, r#"{"Codex":4,"持久化":3}"#).unwrap();
+        assert_eq!(load_asr_vocabulary(file.to_str()).unwrap()["Codex"], 4);
     }
 
     #[test]

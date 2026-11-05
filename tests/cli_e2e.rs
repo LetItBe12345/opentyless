@@ -83,7 +83,14 @@ fn handle_connection(mut stream: TcpStream, behavior: MockBehavior) {
     }
 
     let request_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let response_body = if body_str.contains("qwen3-asr-flash") {
+    let response_body = if body_str.contains("qwen-audio-3.1-asr-flash") {
+        assert!(request_body["input"]["messages"].is_array());
+        assert_eq!(
+            request_body["parameters"]["language_hints"],
+            serde_json::json!(["zh", "en"])
+        );
+        r#"{"output":{"output":{"sentence":{"text":"测试语音原文"}}}}"#
+    } else if body_str.contains("qwen3-asr-flash") {
         r#"{"choices":[{"message":{"content":[{"type":"text","text":"测试语音原文"}]}}]}"#
     } else {
         assert_eq!(request_body["response_format"]["type"], "json_object");
@@ -828,4 +835,29 @@ fn daemon_sigterm_stops_the_microphone_child_and_removes_socket() {
         serde_json::from_str(&fs::read_to_string(harness.status_path()).unwrap()).unwrap();
     assert_eq!(state["recording"], false);
     assert_eq!(state["last_event"], "daemon_stopped");
+}
+
+#[test]
+fn native_asr_file_transcription_uses_both_stages_without_daemon_state() {
+    let harness = Harness::new();
+    let (addr, server) = spawn_mock_server(MockBehavior::Success, 2);
+    let output = harness
+        .base_command(&["transcribe-file", harness.fixture.to_str().unwrap()])
+        .env("ASR_MODEL", "qwen-audio-3.1-asr-flash")
+        .env("ASR_API_URL", format!("http://{addr}/native-asr"))
+        .env("FLASH_API_URL", format!("http://{addr}/chat/completions"))
+        .env("ASR_API_KEY", "test")
+        .env("FLASH_API_KEY", "test")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["raw"], "测试语音原文");
+    assert_eq!(response["polished"], "测试语音整理后");
+    assert!(!harness.state_dir.join("status.json").exists());
+    server.join().unwrap();
 }
