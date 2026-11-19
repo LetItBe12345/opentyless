@@ -1,11 +1,26 @@
 //! macOS service integration. The Swift app owns AppKit, audio and hotkeys;
 //! transcription, state and the socket protocol remain in Rust.
-use super::*;
+use std::fs;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow, bail};
+
+use crate::Commands;
+use crate::config::{Config, ensure_installed_env_file, installed_config_dir};
+use crate::daemon::{Request, daemon_running, pid_matches_expected_process, send_request};
+use crate::desktop::{print_output, run_command, run_command_allow_fail};
+use crate::state::State;
 
 const DAEMON: &str = "local.opentyless.daemon";
 const TRAY: &str = "local.opentyless.tray";
+const MAX_LOG_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const KEEP_LOG_TAIL_BYTES: u64 = 512 * 1024;
 
-pub(super) fn helper_path() -> Result<PathBuf> {
+pub(crate) fn helper_path() -> Result<PathBuf> {
     let current = fs::canonicalize(std::env::current_exe()?)?;
     let sibling = current.parent().unwrap().join("OpenTyless");
     if sibling.is_file() {
@@ -81,11 +96,60 @@ fn render_agent(executable: &Path, config_dir: &Path, logs: &Path, tray: bool) -
     plist::Value::Dictionary(d)
 }
 
+fn rotate_logs_if_oversized(logs_dir: &Path) {
+    for name in [
+        "daemon.log",
+        "daemon-error.log",
+        "tray.log",
+        "tray-error.log",
+    ] {
+        let path = logs_dir.join(name);
+        let Ok(meta) = fs::metadata(&path) else {
+            continue;
+        };
+        if meta.len() <= MAX_LOG_FILE_BYTES {
+            continue;
+        }
+        if let Ok(mut file) = fs::File::open(&path) {
+            let offset = meta.len().saturating_sub(KEEP_LOG_TAIL_BYTES);
+            if file.seek(SeekFrom::Start(offset)).is_ok() {
+                let mut tail = Vec::new();
+                if file.read_to_end(&mut tail).is_ok() {
+                    let start = tail.iter().position(|&b| b == b'\n').map_or(0, |i| i + 1);
+                    let _ = fs::write(&path, &tail[start..]);
+                }
+            }
+        }
+    }
+}
+
+fn read_tail_lines(path: &Path, count: usize) -> String {
+    let Ok(mut file) = fs::File::open(path) else {
+        return String::new();
+    };
+    let Ok(meta) = file.metadata() else {
+        return String::new();
+    };
+    let window = (count.saturating_mul(512).max(64 * 1024)) as u64;
+    let offset = meta.len().saturating_sub(window);
+    if offset > 0 && file.seek(SeekFrom::Start(offset)).is_err() {
+        return String::new();
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(count)..].join("\n")
+}
+
 fn install(tray: bool, enable: bool) -> Result<()> {
     ensure_installed_env_file()?;
     let dir = installed_config_dir();
     let logs = PathBuf::from(std::env::var("HOME")?).join("Library/Logs/opentyless");
     fs::create_dir_all(&logs)?;
+    rotate_logs_if_oversized(&logs);
     let path = agent_path(tray)?;
     fs::create_dir_all(path.parent().unwrap())?;
     let exe = if tray {
@@ -118,6 +182,7 @@ fn install(tray: bool, enable: bool) -> Result<()> {
     );
     Ok(())
 }
+
 fn uninstall(tray: bool) -> Result<()> {
     run_command_allow_fail("launchctl", &["bootout", &target(tray)])?;
     let path = agent_path(tray)?;
@@ -126,6 +191,7 @@ fn uninstall(tray: bool) -> Result<()> {
     }
     Ok(())
 }
+
 fn status(tray: bool) -> Result<()> {
     let output = Command::new("launchctl")
         .args(["print", &target(tray)])
@@ -137,6 +203,7 @@ fn status(tray: bool) -> Result<()> {
     }
     Ok(())
 }
+
 fn control(tray: bool, action: &str) -> Result<()> {
     let loaded = Command::new("launchctl")
         .args(["print", &target(tray)])
@@ -175,6 +242,7 @@ fn control(tray: bool, action: &str) -> Result<()> {
             }
             let logs = PathBuf::from(std::env::var("HOME")?).join("Library/Logs/opentyless");
             fs::create_dir_all(&logs)?;
+            rotate_logs_if_oversized(&logs);
             Command::new(std::env::current_exe()?)
                 .arg("daemon")
                 .current_dir(installed_config_dir())
@@ -227,12 +295,7 @@ fn logs(tray: bool, count: usize) -> Result<()> {
     let stem = if tray { "tray" } else { "daemon" };
     let dir = PathBuf::from(std::env::var("HOME")?).join("Library/Logs/opentyless");
     for name in [format!("{stem}.log"), format!("{stem}-error.log")] {
-        let text = fs::read_to_string(dir.join(&name)).unwrap_or_default();
-        let lines: Vec<_> = text.lines().collect();
-        println!(
-            "{name}:\n{}",
-            lines[lines.len().saturating_sub(count)..].join("\n")
-        );
+        println!("{name}:\n{}", read_tail_lines(&dir.join(&name), count));
     }
     Ok(())
 }
@@ -277,29 +340,10 @@ pub(super) fn handle_command(command: &Commands, _config: &Config) -> Option<Res
     })
 }
 
-static SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-extern "C" fn request_shutdown(_: libc::c_int) {
-    SHUTDOWN.store(true, std::sync::atomic::Ordering::Relaxed);
-}
-pub(super) fn install_shutdown_handlers() -> Result<()> {
-    SHUTDOWN.store(false, std::sync::atomic::Ordering::Relaxed);
-    for signal in [libc::SIGINT, libc::SIGTERM] {
-        if unsafe { libc::signal(signal, request_shutdown as *const () as libc::sighandler_t) }
-            == libc::SIG_ERR
-        {
-            return Err(std::io::Error::last_os_error().into());
-        }
-    }
-    Ok(())
-}
-pub(super) fn shutdown_requested() -> bool {
-    SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// launchd does not inherit the terminal's UTF-8 locale. Without it pbcopy
 /// can exit 0 while silently discarding non-ASCII text. Unlike wl-copy/xclip,
 /// pbcopy must finish before we report that the clipboard was updated.
-pub(super) fn copy_with_pbcopy(program: &str, args: &[String], text: &str) -> Result<()> {
+pub(crate) fn copy_with_pbcopy(program: &str, args: &[String], text: &str) -> Result<()> {
     let mut child = Command::new(program)
         .args(args)
         .env("LANG", "en_US.UTF-8")

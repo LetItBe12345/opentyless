@@ -89,9 +89,18 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
 }
 
+compute_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1"
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1"
+  else
+    die "missing required command: sha256sum or shasum"
+  fi
+}
+
 require_command git
 require_command tar
-require_command sha256sum
 require_command gh
 require_command cargo
 
@@ -136,7 +145,7 @@ install -m 0644 "${PROJECT_ROOT}/.env.example" "${PACKAGE_DIR}/.env.example"
 
 log "creating archive ${ARCHIVE_PATH}"
 tar -C "${DIST_DIR}" -czf "${ARCHIVE_PATH}" "${PACKAGE_BASENAME}"
-sha256sum "${ARCHIVE_PATH}" > "${CHECKSUM_PATH}"
+compute_sha256 "${ARCHIVE_PATH}" > "${CHECKSUM_PATH}"
 
 RELEASE_NOTES="$(mktemp)"
 cat > "${RELEASE_NOTES}" <<EOF

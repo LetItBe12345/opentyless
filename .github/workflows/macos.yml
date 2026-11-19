@@ -1,8 +1,20 @@
-name: macOS
+name: CI
 on:
   push:
   pull_request:
 jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: bash -n install.sh scripts/hotkey-toggle.sh scripts/release.sh scripts/stage-npm-runtime.sh
+
   macos:
     runs-on: macos-latest
     steps:
@@ -13,7 +25,7 @@ jobs:
       - run: cargo fmt --check
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: bash -n install.sh scripts/build-macos.sh scripts/install-macos.sh
-      - run: bash ./scripts/test-macos-mouse.sh
+      - run: bash -n install.sh scripts/build-macos.sh scripts/install-macos.sh scripts/test-macos-mouse.sh
       - run: ./scripts/build-macos.sh
+      - run: ./scripts/test-macos-mouse.sh
       - run: plutil -lint target/macos/OpenTyless.app/Contents/Info.plist

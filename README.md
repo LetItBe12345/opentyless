@@ -178,15 +178,15 @@ DASHSCOPE_API_KEY=your_dashscope_key
 
 Defaults already assume DashScope compatible mode:
 
-- base URL: `https://dashscope.aliyuncs.com/compatible-mode/v1`
-- ASR model: `qwen3-asr-flash`
-- cleanup model: `qwen-flash`
+- base URL: `https://dashscope.aliyuncs.com/compatible-mode/v1` (ASR) / `https://api.deepseek.com` (cleanup when `DEEPSEEK_API_KEY` is set)
+- ASR model: `qwen3-asr-flash` (or `qwen-audio-3.1-asr-flash` for native multimodal ASR)
+- cleanup model: `deepseek-flash` (DeepSeek V4.1 Flash with `thinking={"type":"disabled"}` when `DEEPSEEK_API_KEY` is configured) or `qwen-plus` (`enable_thinking=false`)
 
 Useful optional variables:
 
-- `RECORDER_CMD`: override the recording command
-- `FLASH_PROMPT`: override the cleanup system prompt; requests already wrap transcripts in `<raw_transcript>...</raw_transcript>`, force JSON mode, and use low-temperature decoding
-- `FLASH_EXTRA_BODY_JSON`: merge extra JSON into the cleanup request body; defaults already include `response_format={"type":"json_object"}`, `temperature=0.1`, and `seed=7`
+- `RECORDER_CMD`: override the recording command (supports quoted paths and arguments)
+- `FLASH_PROMPT`: override the cleanup system prompt; leaving it empty uses the built-in Typeless-style spoken cleanup prompt (aggressive filler removal, spoken self-correction pruning, smart numbered/bullet lists, and few-shot examples)
+- `FLASH_EXTRA_BODY_JSON`: merge extra JSON into the cleanup request body; defaults already include `response_format={"type":"json_object"}`, `temperature=0.1`, `seed=7`, and `enable_thinking=false`
 - `AUTO_COPY_TO_CLIPBOARD`: enable or disable automatic copy
 - `CLIPBOARD_COMMAND`: force `xclip`, `wl-copy`, or a custom command
 - `ENABLE_NOTIFICATIONS`: enable or disable desktop notifications

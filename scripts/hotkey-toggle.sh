@@ -15,8 +15,16 @@ fi
 STATE_HOME="${XDG_STATE_HOME:-${HOME}/.local/state}"
 LOG_DIR="${STATE_HOME}/opentyless"
 LOG_PATH="${LOG_DIR}/hotkey.log"
+MAX_LOG_BYTES=262144
 
 mkdir -p "${LOG_DIR}"
+
+if [[ -f "${LOG_PATH}" ]]; then
+  log_size="$(wc -c <"${LOG_PATH}" 2>/dev/null || echo 0)"
+  if [[ "${log_size}" -gt "${MAX_LOG_BYTES}" ]]; then
+    tail -n 200 "${LOG_PATH}" >"${LOG_PATH}.tmp" 2>/dev/null && mv -f "${LOG_PATH}.tmp" "${LOG_PATH}"
+  fi
+fi
 
 timestamp() {
   date '+%Y-%m-%d %H:%M:%S%z'

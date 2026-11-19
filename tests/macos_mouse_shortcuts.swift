@@ -7,10 +7,12 @@ enum MouseShortcutsTests {
     let shortcuts = MouseShortcuts()
     var recordings = 0
     var pastes = 0
+    var enters = 0
     shortcuts.onAction = { action in
       switch action {
       case .toggleRecording: recordings += 1
       case .paste: pastes += 1
+      case .enter: enters += 1
       }
     }
     func send(_ type: CGEventType, _ button: Int64) -> Bool {
@@ -31,8 +33,20 @@ enum MouseShortcutsTests {
     precondition(recordings == 2)
 
     precondition(send(.otherMouseDown, 3))
+    precondition(pastes == 0)
     precondition(send(.otherMouseUp, 3))
     precondition(pastes == 1 && recordings == 2)
+    // The hold sends Return at the threshold, without paste or repeat on release.
+    precondition(send(.otherMouseDown, 3))
+    RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.35))
+    precondition(enters == 0 && pastes == 1)
+    RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.25))
+    precondition(enters == 1 && pastes == 1)
+    precondition(send(.otherMouseDown, 3))
+    RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.8))
+    precondition(send(.otherMouseUp, 3))
+    precondition(enters == 1 && pastes == 1)
+
     // Unassigned buttons and other event types must pass through untouched.
     for button: Int64 in [0, 1, 2, 5, 6] {
       precondition(!send(.otherMouseDown, button))
@@ -56,6 +70,14 @@ enum MouseShortcutsTests {
     precondition(send(.otherMouseUp, 3))
     precondition(recordings == 5)
 
+    let returnEvents = MouseShortcuts.enterEvents()
+    precondition(returnEvents.count == 2)
+    precondition(returnEvents[0].type == .keyDown && returnEvents[1].type == .keyUp)
+    for event in returnEvents {
+      precondition(event.getIntegerValueField(.keyboardEventKeycode) == Int64(kVK_Return))
+      precondition(event.flags.isEmpty)
+    }
+
     let events = MouseShortcuts.pasteEvents()
     precondition(events.count == 2)
     precondition(events[0].type == .keyDown && events[1].type == .keyUp)
@@ -64,6 +86,6 @@ enum MouseShortcutsTests {
       precondition(event.flags == .maskCommand)
     }
     print(
-      "Passed: side-button clicks, holds, releases, drags, swapping, reset, and Command-V events")
+      "Passed: side-button clicks, holds, releases, drags, swapping, reset, 0.5-second Return hold, and Command-V events")
   }
 }
