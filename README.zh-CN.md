@@ -179,15 +179,15 @@ DASHSCOPE_API_KEY=your_dashscope_key
 
 默认已经按 DashScope compatible mode 预设：
 
-- Base URL：`https://dashscope.aliyuncs.com/compatible-mode/v1`
-- ASR 模型：`qwen3-asr-flash`
-- 整理模型：`qwen-flash`
+- Base URL：`https://dashscope.aliyuncs.com/compatible-mode/v1`（ASR）/ `https://api.deepseek.com`（配置 `DEEPSEEK_API_KEY` 时用于文本精修）
+- ASR 模型：`qwen3-asr-flash`（推荐短语音配置 `qwen-audio-3.1-asr-flash`）
+- 整理模型：配置 `DEEPSEEK_API_KEY` 时默认使用 `deepseek-flash`（DeepSeek V4.1 Flash，自动附加 `thinking={"type":"disabled"}` 关闭思考模式）；仅配置 `DASHSCOPE_API_KEY` 时默认使用 `qwen-plus`（自动附加 `enable_thinking=false`）
 
 常用可选变量：
 
-- `RECORDER_CMD`：自定义录音命令
-- `FLASH_PROMPT`：覆盖整理阶段的 system prompt；程序默认已经把原文包进 `<raw_transcript>...</raw_transcript>`，并强制 JSON mode + 低温度解码
-- `FLASH_EXTRA_BODY_JSON`：向整理请求体 merge 额外 JSON；默认已包含 `response_format={"type":"json_object"}`、`temperature=0.1`、`seed=7`
+- `RECORDER_CMD`：自定义录音命令（支持带引号的路径与参数）
+- `FLASH_PROMPT`：覆盖整理阶段的 system prompt；留空时默认内置 Typeless 风格口播精修规则（激进清理口水词与重复、消解口播自我纠正、多要点智能分条目 + Few-Shot 示例）
+- `FLASH_EXTRA_BODY_JSON`：向整理请求体 merge 额外 JSON；默认已包含 `response_format={"type":"json_object"}`、`temperature=0.1`、`seed=7` 及 `enable_thinking=false`
 - `AUTO_COPY_TO_CLIPBOARD`：是否自动复制
 - `CLIPBOARD_COMMAND`：显式指定 `xclip`、`wl-copy` 或自定义命令
 - `ENABLE_NOTIFICATIONS`：是否启用桌面通知

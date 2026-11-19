@@ -378,6 +378,19 @@ fn daemon_cli_flow_works_with_mock_server() {
     assert!(status.contains("测试语音原文"));
     assert!(status.contains("测试语音整理后"));
 
+    let leftover_wavs = fs::read_dir(&harness.run_dir)
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.starts_with("recording_") && name.ends_with(".wav")
+        })
+        .count();
+    assert_eq!(
+        leftover_wavs, 0,
+        "temporary recording wav should be cleaned up"
+    );
+
     let outputs: Vec<_> = fs::read_dir(&harness.output_dir).unwrap().collect();
     assert_eq!(outputs.len(), 1);
     let md = fs::read_to_string(outputs[0].as_ref().unwrap().path()).unwrap();
@@ -417,6 +430,19 @@ fn toggle_record_flow_works_with_mock_server() {
     let status = wait_for_event(&harness.status_path(), "pipeline_completed");
     assert!(status.contains("测试语音原文"));
     assert!(status.contains("测试语音整理后"));
+
+    let leftover_wavs = fs::read_dir(&harness.run_dir)
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.starts_with("recording_") && name.ends_with(".wav")
+        })
+        .count();
+    assert_eq!(
+        leftover_wavs, 0,
+        "temporary recording wav should be cleaned up"
+    );
 
     kill_daemon(daemon);
     server.join().unwrap();
@@ -550,6 +576,28 @@ fn hanging_clipboard_does_not_block_pipeline_completion() {
 }
 
 #[test]
+fn saving_two_recordings_without_transcription_keeps_both_files() {
+    let harness = Harness::new();
+    harness.looping_recorder();
+    let daemon = harness.spawn_daemon("127.0.0.1:1");
+    wait_for(&harness.socket_path);
+    for _ in 0..2 {
+        assert_success(&harness.run(&["start-record"]));
+        wait_for_state_audio(&harness.status_path());
+        assert_success(&harness.run(&["save-record"]));
+        let status = wait_for_event(&harness.status_path(), "recording_saved");
+        let state: serde_json::Value = serde_json::from_str(&status).unwrap();
+        let path = PathBuf::from(state["audio_path"].as_str().unwrap());
+        assert_eq!(path.parent(), Some(harness.output_dir.as_path()));
+        assert!(fs::metadata(path).unwrap().len() > 0);
+        assert_eq!(state["recording"], false);
+        assert!(state["last_output_path"].is_null());
+    }
+    assert_eq!(fs::read_dir(&harness.output_dir).unwrap().count(), 2);
+    kill_daemon(daemon);
+}
+
+#[test]
 fn cancel_record_discards_audio_without_pipeline() {
     let harness = Harness::new();
     harness.looping_recorder();
@@ -663,6 +711,10 @@ fn pipeline_failure_sets_error_state() {
 
     let status = wait_for_event(&harness.status_path(), "pipeline_failed");
     assert!(status.contains("error"), "{status}");
+    assert!(
+        status.contains("mock asr failed"),
+        "API error detail should be preserved: {status}"
+    );
 
     kill_daemon(daemon);
     server.join().unwrap();
@@ -802,7 +854,6 @@ fn macos_service_install_preserves_existing_env_and_writes_launch_agent() {
     assert!(!agent.contains("systemctl"));
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn daemon_sigterm_stops_the_microphone_child_and_removes_socket() {
     let harness = Harness::new();

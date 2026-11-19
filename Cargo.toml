@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+tempfile = "3.13"
 anyhow = "1.0"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
@@ -19,6 +20,3 @@ ksni = { version = "0.3.3", features = ["blocking"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 plist = "1"
-
-[dev-dependencies]
-tempfile = "3.13"

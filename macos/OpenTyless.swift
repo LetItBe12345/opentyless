@@ -2,6 +2,8 @@ import AVFoundation
 import AppKit
 import ApplicationServices
 import Carbon
+import Darwin
+import QuartzCore
 
 // A small native shell; the Rust CLI remains the only transcription pipeline.
 let home = FileManager.default.homeDirectoryForCurrentUser
@@ -28,18 +30,76 @@ func runCLI(_ args: [String]) -> (Int32, String) {
   } catch { return (-1, error.localizedDescription) }
 }
 
-func setting(_ name: String) -> String? {
-  if let value = ProcessInfo.processInfo.environment[name] { return value.isEmpty ? nil : value }
-  let text =
-    (try? String(contentsOf: configDir.appendingPathComponent(".env"), encoding: .utf8)) ?? ""
-  for line in text.components(separatedBy: .newlines) {
-    let parts = line.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
-    guard parts.count == 2, parts[0].trimmingCharacters(in: .whitespaces) == name else { continue }
-    let value = String(parts[1]).trimmingCharacters(in: CharacterSet(charactersIn: "\"' "))
-    return value.isEmpty ? nil : value
+final class EnvStore {
+  private var cachedValues: [String: String] = [:]
+  private var lastModified: Date?
+  private var fileExisted = false
+
+  func get(_ name: String) -> String? {
+    if let envVal = ProcessInfo.processInfo.environment[name]?.trimmingCharacters(in: .whitespaces),
+      !envVal.isEmpty
+    {
+      return envVal
+    }
+    reloadIfNeeded()
+    return cachedValues[name]
   }
-  return nil
+
+  func invalidate() {
+    lastModified = nil
+  }
+
+  private func reloadIfNeeded() {
+    let envURL = configDir.appendingPathComponent(".env")
+    let attrs = try? FileManager.default.attributesOfItem(atPath: envURL.path)
+    let mtime = attrs?[.modificationDate] as? Date
+    let exists = attrs != nil
+    if exists == fileExisted && mtime == lastModified {
+      return
+    }
+    fileExisted = exists
+    lastModified = mtime
+    guard exists, let text = try? String(contentsOf: envURL, encoding: .utf8) else {
+      cachedValues = [:]
+      return
+    }
+    cachedValues = Self.parse(text)
+  }
+
+  static func parse(_ text: String) -> [String: String] {
+    var result: [String: String] = [:]
+    for rawLine in text.components(separatedBy: .newlines) {
+      var line = rawLine.trimmingCharacters(in: .whitespaces)
+      if line.isEmpty || line.hasPrefix("#") { continue }
+      if line.hasPrefix("export ") {
+        line = String(line.dropFirst("export ".count)).trimmingCharacters(in: .whitespaces)
+      }
+      let parts = line.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+      guard parts.count == 2 else { continue }
+      let key = parts[0].trimmingCharacters(in: .whitespaces)
+      guard !key.isEmpty else { continue }
+      var rawVal = parts[1].trimmingCharacters(in: .whitespaces)
+      if (rawVal.hasPrefix("\"") && rawVal.hasSuffix("\"") && rawVal.count >= 2)
+        || (rawVal.hasPrefix("'") && rawVal.hasSuffix("'") && rawVal.count >= 2)
+      {
+        rawVal = String(rawVal.dropFirst().dropLast())
+      } else if let commentRange = rawVal.range(of: " #") {
+        rawVal = String(rawVal[..<commentRange.lowerBound]).trimmingCharacters(in: .whitespaces)
+      }
+      if !rawVal.isEmpty {
+        result[key] = rawVal
+      }
+    }
+    return result
+  }
 }
+
+let envStore = EnvStore()
+
+func setting(_ name: String) -> String? {
+  envStore.get(name)
+}
+
 func stateURL() -> URL {
   if let dir = setting("STATE_DIR") {
     return URL(fileURLWithPath: dir).appendingPathComponent("status.json")
@@ -49,12 +109,22 @@ func stateURL() -> URL {
     ?? home.appendingPathComponent(".local/state")
   return base.appendingPathComponent("opentyless/state/status.json")
 }
+
 func outputURL() -> URL {
   if let dir = setting("OUTPUT_DIR") { return URL(fileURLWithPath: dir) }
   let base =
     setting("XDG_DATA_HOME").map { URL(fileURLWithPath: $0) }
     ?? home.appendingPathComponent(".local/share")
   return base.appendingPathComponent("opentyless/outputs")
+}
+
+func isDaemonProcessAlive(_ pid: Int32) -> Bool {
+  guard pid > 0, kill(pid, 0) == 0 else { return false }
+  var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+  let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+  guard length > 0 else { return true }
+  let path = String(cString: buffer)
+  return URL(fileURLWithPath: path).lastPathComponent == "opentyless-rs"
 }
 
 // Recorder mode is a child of the daemon. SIGINT/SIGTERM finalize the WAV.
@@ -124,17 +194,54 @@ let hotkeys = [
   HotkeyChoice(name: "⌥Space", key: UInt32(kVK_Space), modifiers: UInt32(optionKey)),
 ]
 
+enum PillKind {
+  case listening
+  case transcribing
+  case success(String)
+  case neutral(String)
+  case warning(String)
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   var item: NSStatusItem!
-  var timer: Timer?
+  var dirWatchers: [DispatchSourceFileSystemObject] = []
+  var watchedStateDirPath: String?
+  var daemonExitWatcher: DispatchSourceProcess?
+  var watchedDaemonPid: Int32 = 0
+  var permissionTimer: Timer?
+  var recordingClockTimer: Timer?
+  var recordingStartedAt: Date?
+  var refreshScheduled = false
+
+  // Settings UI controls
   var settingsWindow: NSWindow?
-  var settingsLabel: NSTextField?
+  var headerStatusDot: NSView?
+  var headerStatusLabel: NSTextField?
+  var hotkeyPopup: NSPopUpButton?
+  var mouseEnableSwitch: NSSwitch?
+  var mouseSwapSwitch: NSSwitch?
+  var micStatusLabel: NSTextField?
+  var micActionButton: NSButton?
+  var axStatusLabel: NSTextField?
+  var axActionButton: NSButton?
+  var loginSwitch: NSSwitch?
+  var modelSummaryLabel: NSTextField?
+
+  // Result preview UI
   var resultWindow: NSWindow?
   var resultText: NSTextView?
   var latestText = ""
   var observedEvent: String?
+
+  // Sleek bottom capsule pill HUD
   var hud: NSPanel?
+  var hudDot: NSView?
+  var hudSpinner: NSProgressIndicator?
+  var hudIcon: NSImageView?
+  var hudLabel: NSTextField?
+  var hudTimeLabel: NSTextField?
   var hudHide: DispatchWorkItem?
+
   var hotkey: EventHotKeyRef?
   var handler: EventHandlerRef?
   let mouseShortcuts = MouseShortcuts()
@@ -142,24 +249,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   var mouseShortcutsEnabled: Bool {
     preferences.object(forKey: "mouseShortcutsEnabled") as? Bool ?? true
   }
-  var mouseShortcutStatus: String {
-    if !mouseShortcutsEnabled { return "已关闭" }
-    if !AXIsProcessTrusted() { return "请授权辅助功能" }
-    return mouseShortcutError ?? (mouseShortcuts.isRunning ? "上侧键录音 / 下侧键粘贴" : "正在连接")
-  }
   var selected = 0
   var busy = false
   var menuTracking = false
   var renderedState = ""
   var hotkeyError: String?
-  var statusText = "正在连接后台服务…"
+  var statusText = "连接中…"
   var lastError: String?
   var recording = false
   var transcribing = false
+
   var apiConfigured: Bool {
-    setting("DASHSCOPE_API_KEY") != nil
-      || (setting("ASR_API_KEY") != nil && setting("FLASH_API_KEY") != nil)
+    let hasAsr = setting("ASR_API_KEY") != nil || setting("DASHSCOPE_API_KEY") != nil
+    let hasFlash =
+      setting("FLASH_API_KEY") != nil || setting("DEEPSEEK_API_KEY") != nil
+      || setting("DASHSCOPE_API_KEY") != nil
+    return hasAsr && hasFlash
   }
+
+  var activeModelSummary: String {
+    let asr = setting("ASR_MODEL") ?? "qwen3-asr-flash"
+    let defaultFlash = setting("DEEPSEEK_API_KEY") != nil ? "DeepSeek V4.1 Flash" : "Qwen Plus"
+    let rawFlash = setting("FLASH_MODEL") ?? defaultFlash
+    let flashDisplay =
+      rawFlash.lowercased() == "deepseek-flash" || rawFlash.lowercased() == "deepseek-v4.1-flash"
+      ? "DeepSeek V4.1 Flash" : rawFlash
+    return "语音 \(asr)  ·  精修 \(flashDisplay)"
+  }
+
   var loginEnabled: Bool {
     ["daemon", "tray"].allSatisfy {
       FileManager.default.fileExists(
@@ -167,9 +284,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
           .path)
     }
   }
+
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSApp.setActivationPolicy(.accessory)
-    // Avoid duplicate status items if launched through both Finder and launchd.
     let others = NSRunningApplication.runningApplications(
       withBundleIdentifier: Bundle.main.bundleIdentifier ?? "local.opentyless.app")
     if others.contains(where: {
@@ -195,30 +312,108 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     if handlerCode == noErr {
       registerHotkey(selected)
     } else {
-      hotkeyError = "快捷键事件监听失败（\(handlerCode)）"
+      hotkeyError = "快捷键监听不可用（\(handlerCode)）"
     }
     mouseShortcuts.swapped = preferences.bool(forKey: "mouseButtonsSwapped")
     mouseShortcuts.onAction = { [weak self] action in
-      // Keep the event-tap callback short; never run CLI or display UI in it.
       DispatchQueue.main.async {
         guard let self, self.mouseShortcutsEnabled else { return }
         switch action {
         case .toggleRecording: self.toggle()
         case .paste: self.pasteClipboard()
+        case .enter:
+          for event in MouseShortcuts.enterEvents() { event.post(tap: .cgSessionEventTap) }
         }
       }
     }
-    DispatchQueue.global(qos: .utility).async { _ = runCLI(["start"]) }
+    installDirectoryWatchers()
+    DispatchQueue.global(qos: .utility).async { [weak self] in
+      _ = runCLI(["start"])
+      DispatchQueue.main.async { self?.scheduleRefresh() }
+    }
     refresh()
     if !preferences.bool(forKey: "hasLaunched") {
       preferences.set(true, forKey: "hasLaunched")
       showSettings()
     }
-    timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-      self?.refresh()
-    }
-    RunLoop.main.add(timer!, forMode: .common)
   }
+
+  func applicationDidBecomeActive(_ notification: Notification) {
+    scheduleRefresh()
+  }
+
+  private func scheduleRefresh() {
+    guard !refreshScheduled else { return }
+    refreshScheduled = true
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      self.refreshScheduled = false
+      self.refresh()
+    }
+  }
+
+  private func watchDirectory(_ url: URL) -> DispatchSourceFileSystemObject? {
+    try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    let fd = open(url.path, O_EVTONLY)
+    guard fd >= 0 else { return nil }
+    let source = DispatchSource.makeFileSystemObjectSource(
+      fileDescriptor: fd,
+      eventMask: [.write, .rename, .delete, .attrib],
+      queue: .main)
+    source.setEventHandler { [weak self] in
+      envStore.invalidate()
+      self?.scheduleRefresh()
+    }
+    source.setCancelHandler { close(fd) }
+    source.resume()
+    return source
+  }
+
+  private func installDirectoryWatchers() {
+    for watcher in dirWatchers { watcher.cancel() }
+    dirWatchers.removeAll()
+    let stateDir = stateURL().deletingLastPathComponent()
+    watchedStateDirPath = stateDir.path
+    for dir in [configDir, stateDir, home.appendingPathComponent("Library/LaunchAgents")] {
+      if let watcher = watchDirectory(dir) {
+        dirWatchers.append(watcher)
+      }
+    }
+  }
+
+  private func updateDaemonProcessWatcher(_ pid: Int32, running: Bool) {
+    let targetPid = running ? pid : 0
+    guard targetPid != watchedDaemonPid else { return }
+    daemonExitWatcher?.cancel()
+    daemonExitWatcher = nil
+    watchedDaemonPid = targetPid
+    guard targetPid > 0 else { return }
+    let source = DispatchSource.makeProcessSource(
+      identifier: targetPid, eventMask: .exit, queue: .main)
+    source.setEventHandler { [weak self] in
+      self?.scheduleRefresh()
+    }
+    source.resume()
+    daemonExitWatcher = source
+  }
+
+  private func syncAccessibilityPollTimer() {
+    let needsTrustWatch = mouseShortcutsEnabled && !AXIsProcessTrusted()
+    if needsTrustWatch && permissionTimer == nil {
+      let timer = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
+        guard let self else { return }
+        if !self.mouseShortcutsEnabled || AXIsProcessTrusted() {
+          self.scheduleRefresh()
+        }
+      }
+      permissionTimer = timer
+      RunLoop.main.add(timer, forMode: .common)
+    } else if !needsTrustWatch, let timer = permissionTimer {
+      timer.invalidate()
+      permissionTimer = nil
+    }
+  }
+
   func registerHotkey(_ index: Int) {
     var candidate: EventHotKeyRef?
     let choice = hotkeys[index]
@@ -232,131 +427,632 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       preferences.set(index, forKey: "hotkeyIndex")
       hotkeyError = nil
     } else {
-      hotkeyError = "\(choice.name) 注册失败（\(code)），请选择其他快捷键"
+      hotkeyError = "\(choice.name) 已被其他应用占用"
     }
   }
+
   func refresh() {
+    let currentStateURL = stateURL()
+    if currentStateURL.deletingLastPathComponent().path != watchedStateDirPath {
+      installDirectoryWatchers()
+    }
     updateMouseShortcuts()
+    syncAccessibilityPollTimer()
+
     var state: [String: Any] = [:]
-    if let data = try? Data(contentsOf: stateURL()),
+    if let data = try? Data(contentsOf: currentStateURL),
       let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
     {
       state = value
     }
     let pid = state["pid"] as? Int32 ?? 0
-    let running = pid > 0 && kill(pid, 0) == 0
+    let running = isDaemonProcessAlive(pid)
+    updateDaemonProcessWatcher(pid, running: running)
+
+    let wasRecording = recording
     recording = running && state["recording"] as? Bool == true
     transcribing = running && state["last_event"] as? String == "transcribing"
     lastError = state["error"] as? String
     latestText = state["last_polished_text"] as? String ?? ""
+
+    if recording && !wasRecording {
+      startRecordingClock()
+    } else if !recording && wasRecording {
+      stopRecordingClock()
+    }
+
     let event = state["last_event"] as? String ?? ""
     let eventID =
       "\(event)|\(state["audio_path"] as? String ?? "")|\(state["last_output_path"] as? String ?? "")|\(lastError ?? "")"
     if let previous = observedEvent, previous != eventID {
       switch event {
       case "recording_started":
-        showHUD("开始录音", "再按 \(hotkeys[selected].name) 停止并转写", symbol: "mic.fill", persistent: true)
+        showPill(.listening, persistent: true)
       case "transcribing":
-        showHUD("已停止录音，正在转写", "正在识别语音并整理文字…", symbol: "waveform", persistent: true)
+        showPill(.transcribing, persistent: true)
       case "pipeline_completed":
         if lastError != nil {
-          showHUD("转写完成，但复制失败", "结果已保存，请从菜单重新复制或查看错误", symbol: "exclamationmark.triangle")
+          showPill(.warning("复制失败"), duration: 2.2)
         } else {
-          showHUD(
-            "转写完成",
-            state["clipboard_copied"] as? Bool == true ? "已复制，按鼠标下侧键或 ⌘V 粘贴" : "结果已保存，可从状态栏查看和复制",
-            symbol: "checkmark.circle.fill")
+          let copied = state["clipboard_copied"] as? Bool == true
+          showPill(.success(copied ? "已复制" : "已完成"), duration: 1.3)
         }
-      case "recording_cancelled": showHUD("已取消录音", "本次音频未发送转写", symbol: "xmark.circle")
+      case "recording_saved":
+        showPill(.success("音频已保存"), duration: 1.3)
+      case "recording_cancelled":
+        showPill(.neutral("已取消"), duration: 1.0)
       case "pipeline_failed", "command_failed":
-        showHUD("处理未完成", "请从状态栏查看错误详情后重试", symbol: "exclamationmark.triangle")
-      default: hud?.orderOut(nil)
+        showPill(.warning("处理失败"), duration: 2.4)
+      default:
+        dismissPill()
       }
     }
     observedEvent = eventID
+
+    let configured = apiConfigured
     statusText =
       !running
-      ? "后台服务未运行"
-      : recording
-        ? "正在录音，再按快捷键停止" : transcribing ? "正在转写和整理…" : lastError != nil ? "处理出错，点击查看详情" : "就绪"
+      ? "服务未运行"
+      : !configured
+        ? "待配置密钥"
+        : recording
+          ? "正在聆听" : transcribing ? "正在整理…" : lastError != nil ? "出现错误" : "就绪"
+
+    let login = loginEnabled
+    let axTrusted = AXIsProcessTrusted()
+    let micAuth = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
     let fingerprint =
-      "\(latestText)|\(statusText)|\(lastError ?? "")|\(selected)|\(hotkeyError ?? "")|\(loginEnabled)|\(busy)|\(settingsWindow != nil)|\(apiConfigured)|\(mouseShortcutStatus)|\(mouseShortcuts.swapped)"
+      "\(latestText)|\(statusText)|\(lastError ?? "")|\(selected)|\(hotkeyError ?? "")|\(login)|\(busy)|\(settingsWindow != nil)|\(configured)|\(mouseShortcutsEnabled)|\(mouseShortcuts.isRunning)|\(mouseShortcutError ?? "")|\(axTrusted)|\(micAuth)|\(mouseShortcuts.swapped)|\(activeModelSummary)"
     guard fingerprint != renderedState else { return }
     if !menuTracking { renderedState = fingerprint }
+
     item.button?.title = recording ? " ●" : transcribing ? " …" : ""
     item.button?.image = NSImage(
-      systemSymbolName: recording ? "mic.fill" : "mic",
+      systemSymbolName: recording ? "waveform.circle.fill" : "waveform",
       accessibilityDescription: "OpenTyless：\(statusText)")
-    item.button?.image?.isTemplate = true
-    item.button?.toolTip =
-      "OpenTyless：\(statusText)\n快捷键：\(hotkeys[selected].name)\n鼠标侧键：\(mouseShortcutStatus)"
-      + (latestText.isEmpty ? "" : "\n最近结果：" + String(latestText.prefix(60)))
-    let hint =
-      apiConfigured
-      ? "按快捷键或鼠标上侧键开始录音，再按一次停止并转写。\n转写完成后，按鼠标下侧键或 ⌘V 粘贴。\n侧键方向相反时，可从状态栏菜单交换上下侧键。"
-      : "请先编辑 API 配置，填写 DASHSCOPE_API_KEY，\n再从状态栏选择「重新加载配置」。"
-    settingsLabel?.stringValue =
-      "后台：\(statusText)\n全局快捷键：\(hotkeys[selected].name)（\(hotkey == nil ? "未注册" : "已注册")）\n鼠标侧键：\(mouseShortcutStatus)\n登录自启动：\(loginEnabled ? "已开启" : "已关闭")\nAPI 配置：\(apiConfigured ? "已填写" : "待填写")\n\n"
-      + hint
+    item.button?.image?.isTemplate = !recording
+    item.button?.contentTintColor = recording ? .systemRed : nil
+    item.button?.toolTip = "OpenTyless · \(statusText)（\(hotkeys[selected].name)）"
+
+    updateSettingsControls(
+      running: running, configured: configured, login: login, micAuth: micAuth, axTrusted: axTrusted
+    )
     if item.menu == nil || !menuTracking { buildMenu() }
   }
-  func add(_ menu: NSMenu, _ title: String, _ action: Selector?, enabled: Bool = true) -> NSMenuItem
+
+  private func startRecordingClock() {
+    recordingStartedAt = Date()
+    recordingClockTimer?.invalidate()
+    let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+      guard let self, self.recording, let started = self.recordingStartedAt else { return }
+      let elapsed = max(0, Int(Date().timeIntervalSince(started)))
+      self.hudTimeLabel?.stringValue = String(format: "%d:%02d", elapsed / 60, elapsed % 60)
+    }
+    recordingClockTimer = timer
+    RunLoop.main.add(timer, forMode: .common)
+  }
+
+  private func stopRecordingClock() {
+    recordingClockTimer?.invalidate()
+    recordingClockTimer = nil
+    recordingStartedAt = nil
+  }
+
+  // MARK: - Compact Product Menu
+
+  func add(_ menu: NSMenu, _ title: String, _ action: Selector?, key: String = "", enabled: Bool = true)
+    -> NSMenuItem
   {
-    let entry = NSMenuItem(title: title, action: action, keyEquivalent: "")
+    let entry = NSMenuItem(title: title, action: action, keyEquivalent: key)
     entry.target = self
     entry.isEnabled = enabled
     menu.addItem(entry)
     return entry
   }
+
   func buildMenu() {
     let menu = NSMenu()
     menu.autoenablesItems = false
     menu.delegate = self
+
     _ = add(menu, "OpenTyless · \(statusText)", nil, enabled: false)
-    if let hotkeyError { _ = add(menu, hotkeyError, nil, enabled: false) }
-    if lastError != nil { _ = add(menu, "查看错误详情…", #selector(showError)) }
-    menu.addItem(.separator())
-    _ = add(
-      menu, recording ? "停止录音并转写" : "开始录音", #selector(toggle), enabled: !busy && !transcribing)
-    if recording { _ = add(menu, "取消录音", #selector(cancel), enabled: !busy) }
-    _ = add(menu, "查看最近结果…", #selector(showResult), enabled: !latestText.isEmpty)
-    _ = add(menu, "复制最近结果", #selector(copyLast), enabled: !busy && !latestText.isEmpty)
-    _ = add(menu, "打开输出目录", #selector(openOutputs))
-    _ = add(menu, "显示状态提示", #selector(showStatus))
-    _ = add(menu, "设置与状态…", #selector(showSettings))
-    _ = add(menu, "编辑 API 配置…", #selector(openConfig))
-    _ = add(menu, "检查麦克风权限…", #selector(microphone))
-    let shortcut = add(menu, "全局快捷键：\(hotkeys[selected].name)", nil)
-    let submenu = NSMenu()
-    submenu.autoenablesItems = false
-    for (index, choice) in hotkeys.enumerated() {
-      let entry = add(submenu, choice.name, #selector(changeHotkey(_:)))
-      entry.tag = index
-      entry.state = selected == index && hotkey != nil ? .on : .off
+    if let hotkeyError {
+      _ = add(menu, "⚠️ \(hotkeyError)", #selector(showSettings))
     }
-    shortcut.submenu = submenu
-    let mouse = add(menu, "鼠标侧键：\(mouseShortcutStatus)", nil)
+    if lastError != nil {
+      _ = add(menu, "查看错误原因…", #selector(showError))
+    }
+    menu.addItem(.separator())
+
+    if recording {
+      _ = add(menu, "完成并整理", #selector(stopAndTranscribe), enabled: !busy)
+      _ = add(menu, "只保存录音", #selector(saveRecording), enabled: !busy)
+      _ = add(menu, "取消录音", #selector(cancel), enabled: !busy)
+    } else {
+      let label = transcribing ? "正在整理语音…" : "开始语音输入（\(hotkeys[selected].name)）"
+      _ = add(menu, label, #selector(startRecording), enabled: !busy && !transcribing)
+    }
+
+    if !latestText.isEmpty {
+      menu.addItem(.separator())
+      let preview = latestText.replacingOccurrences(of: "\n", with: " ")
+      let clipped = preview.count > 22 ? String(preview.prefix(22)) + "…" : preview
+      _ = add(menu, "“\(clipped)”", nil, enabled: false)
+      _ = add(menu, "复制上次结果", #selector(copyLast), enabled: !busy)
+      _ = add(menu, "查看完整文本…", #selector(showResult))
+    }
+
+    menu.addItem(.separator())
+    let shortcutItem = add(menu, "快捷键 · \(hotkeys[selected].name)", nil)
+    let shortcutMenu = NSMenu()
+    shortcutMenu.autoenablesItems = false
+    for (index, choice) in hotkeys.enumerated() {
+      let entry = add(shortcutMenu, choice.name, #selector(changeHotkeyFromMenu(_:)))
+      entry.tag = index
+      entry.state = (selected == index && hotkey != nil) ? .on : .off
+    }
+    shortcutItem.submenu = shortcutMenu
+
+    let sideState =
+      !mouseShortcutsEnabled
+      ? "已关闭"
+      : !AXIsProcessTrusted()
+        ? "需授权"
+        : (mouseShortcutError == nil && mouseShortcuts.isRunning ? "已启用" : "连接中")
+    let mouseItem = add(menu, "鼠标侧键 · \(sideState)", nil)
     let mouseMenu = NSMenu()
     mouseMenu.autoenablesItems = false
-    let enabled = add(mouseMenu, "启用侧键：上侧录音，下侧粘贴", #selector(toggleMouseShortcuts))
-    enabled.state = mouseShortcutsEnabled ? .on : .off
-    let swap = add(mouseMenu, "交换上下侧键", #selector(swapMouseButtons))
-    swap.state = mouseShortcuts.swapped ? .on : .off
-    _ = add(mouseMenu, "授权辅助功能…", #selector(mousePermission))
-    mouse.submenu = mouseMenu
-    let login = add(
-      menu, "登录时自动启动", #selector(toggleLogin), enabled: !busy && !recording && !transcribing)
-    login.state = loginEnabled ? .on : .off
+    _ = add(mouseMenu, "上侧键：开始录音 / 停止并转写", nil, enabled: false)
+    _ = add(mouseMenu, "下侧键：短按粘贴 · 长按 0.5s 回车发送", nil, enabled: false)
+    mouseMenu.addItem(.separator())
+    let enableEntry = add(mouseMenu, "启用鼠标侧键", #selector(toggleMouseShortcuts))
+    enableEntry.state = mouseShortcutsEnabled ? .on : .off
+    let swapEntry = add(mouseMenu, "交换上下侧键", #selector(swapMouseButtons))
+    swapEntry.state = mouseShortcuts.swapped ? .on : .off
+    _ = add(mouseMenu, "辅助功能权限设置…", #selector(mousePermission))
+    mouseItem.submenu = mouseMenu
+
+    _ = add(menu, "打开输出目录", #selector(openOutputs))
+    _ = add(menu, "偏好设置…", #selector(showSettings), key: ",")
+
+    let moreItem = add(menu, "高级", nil)
+    let moreMenu = NSMenu()
+    moreMenu.autoenablesItems = false
+    _ = add(moreMenu, "编辑配置文件 (.env)…", #selector(openConfig))
     _ = add(
-      menu, "重启后台服务 / 重新加载配置", #selector(restart), enabled: !busy && !recording && !transcribing)
-    _ = add(menu, "查看日志", #selector(openLogs))
+      moreMenu, "重新加载后台服务", #selector(restart),
+      enabled: !busy && !recording && !transcribing)
+    _ = add(moreMenu, "查看运行日志", #selector(openLogs))
+    moreItem.submenu = moreMenu
+
     menu.addItem(.separator())
     _ = add(
-      menu, "退出 OpenTyless（停止后台服务）", #selector(quit), enabled: !busy && !recording && !transcribing)
+      menu, "退出 OpenTyless", #selector(quit), key: "q",
+      enabled: !busy && !recording && !transcribing)
     item.menu = menu
   }
-  func menuWillOpen(_ menu: NSMenu) { menuTracking = true }
-  func menuDidClose(_ menu: NSMenu) { menuTracking = false }
+
+  func menuWillOpen(_ menu: NSMenu) {
+    menuTracking = true
+    refresh()
+  }
+
+  func menuDidClose(_ menu: NSMenu) {
+    menuTracking = false
+    scheduleRefresh()
+  }
+
+  // MARK: - Sleek Bottom Capsule Pill HUD
+
+  private func ensurePill() -> NSPanel {
+    if let hud { return hud }
+    let panel = NSPanel(
+      contentRect: NSRect(x: 0, y: 0, width: 184, height: 40),
+      styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+    panel.title = "OpenTyless"
+    panel.isOpaque = false
+    panel.backgroundColor = .clear
+    panel.hasShadow = true
+    panel.level = .statusBar
+    panel.ignoresMouseEvents = true
+    panel.isReleasedWhenClosed = false
+    panel.appearance = NSAppearance(named: .darkAqua)
+    panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+
+    let effect = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 184, height: 40))
+    effect.autoresizingMask = [.width, .height]
+    effect.material = .hudWindow
+    effect.blendingMode = .behindWindow
+    effect.state = .active
+    effect.wantsLayer = true
+    effect.layer?.cornerRadius = 20
+    effect.layer?.masksToBounds = true
+    effect.layer?.borderWidth = 0.8
+    effect.layer?.borderColor = NSColor.white.withAlphaComponent(0.16).cgColor
+    panel.contentView = effect
+
+    let dot = NSView(frame: NSRect(x: 16, y: 15, width: 10, height: 10))
+    dot.wantsLayer = true
+    dot.layer?.cornerRadius = 5
+    dot.layer?.backgroundColor = NSColor.systemRed.cgColor
+    effect.addSubview(dot)
+
+    let spinner = NSProgressIndicator(frame: NSRect(x: 13, y: 12, width: 16, height: 16))
+    spinner.style = .spinning
+    spinner.controlSize = .small
+    spinner.isDisplayedWhenStopped = false
+    effect.addSubview(spinner)
+
+    let icon = NSImageView(frame: NSRect(x: 13, y: 11, width: 18, height: 18))
+    icon.imageScaling = .scaleProportionallyUpOrDown
+    effect.addSubview(icon)
+
+    let label = NSTextField(labelWithString: "")
+    label.font = .systemFont(ofSize: 13, weight: .medium)
+    label.textColor = .white
+    effect.addSubview(label)
+
+    let timeLabel = NSTextField(labelWithString: "0:00")
+    timeLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+    timeLabel.textColor = NSColor.white.withAlphaComponent(0.65)
+    timeLabel.alignment = .right
+    effect.addSubview(timeLabel)
+
+    hud = panel
+    hudDot = dot
+    hudSpinner = spinner
+    hudIcon = icon
+    hudLabel = label
+    hudTimeLabel = timeLabel
+    return panel
+  }
+
+  private func setRecordingPulse(_ active: Bool) {
+    guard let layer = hudDot?.layer else { return }
+    layer.removeAnimation(forKey: "pulse")
+    guard active else { return }
+    let pulse = CABasicAnimation(keyPath: "opacity")
+    pulse.fromValue = 1.0
+    pulse.toValue = 0.30
+    pulse.duration = 0.75
+    pulse.autoreverses = true
+    pulse.repeatCount = .infinity
+    pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+    layer.add(pulse, forKey: "pulse")
+  }
+
+  func showPill(_ kind: PillKind, persistent: Bool = false, duration: TimeInterval = 1.4) {
+    hudHide?.cancel()
+    let panel = ensurePill()
+    hudDot?.isHidden = true
+    setRecordingPulse(false)
+    hudSpinner?.stopAnimation(nil)
+    hudIcon?.isHidden = true
+    hudTimeLabel?.isHidden = true
+
+    var text = ""
+    var showTimer = false
+    switch kind {
+    case .listening:
+      text = "正在聆听"
+      showTimer = true
+      hudDot?.isHidden = false
+      setRecordingPulse(true)
+      hudTimeLabel?.stringValue = "0:00"
+      hudTimeLabel?.isHidden = false
+    case .transcribing:
+      text = "正在整理…"
+      hudSpinner?.startAnimation(nil)
+    case .success(let msg):
+      text = msg
+      hudIcon?.image = NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: msg)
+      hudIcon?.contentTintColor = .systemGreen
+      hudIcon?.isHidden = false
+    case .neutral(let msg):
+      text = msg
+      hudIcon?.image = NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: msg)
+      hudIcon?.contentTintColor = NSColor.white.withAlphaComponent(0.75)
+      hudIcon?.isHidden = false
+    case .warning(let msg):
+      text = msg
+      hudIcon?.image = NSImage(
+        systemSymbolName: "exclamationmark.circle.fill", accessibilityDescription: msg)
+      hudIcon?.contentTintColor = .systemOrange
+      hudIcon?.isHidden = false
+    }
+
+    hudLabel?.stringValue = text
+    hudLabel?.sizeToFit()
+    let labelWidth = ceil(hudLabel?.frame.width ?? 70)
+    let timerExtra: CGFloat = showTimer ? 44 : 0
+    let pillWidth = max(124, 38 + labelWidth + timerExtra + 18)
+    let height: CGFloat = 40
+
+    hudLabel?.frame = NSRect(x: 36, y: 10, width: labelWidth + 4, height: 20)
+    hudTimeLabel?.frame = NSRect(x: pillWidth - 54, y: 10, width: 38, height: 19)
+
+    let screen =
+      NSScreen.screens.first(where: { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) })
+      ?? NSScreen.main
+    let origin: NSPoint
+    if let screen {
+      origin = NSPoint(
+        x: round(screen.visibleFrame.midX - pillWidth / 2),
+        y: round(screen.visibleFrame.minY + 34))
+    } else {
+      origin = .zero
+    }
+
+    panel.setFrame(NSRect(origin: origin, size: NSSize(width: pillWidth, height: height)), display: true)
+    panel.alphaValue = 1.0
+    panel.orderFrontRegardless()
+
+    if !persistent {
+      let work = DispatchWorkItem { [weak self] in self?.dismissPill() }
+      hudHide = work
+      DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: work)
+    }
+  }
+
+  private func dismissPill() {
+    guard let panel = hud, panel.isVisible else { return }
+    setRecordingPulse(false)
+    NSAnimationContext.runAnimationGroup(
+      { context in
+        context.duration = 0.22
+        panel.animator().alphaValue = 0.0
+      },
+      completionHandler: { [weak panel] in
+        if panel?.alphaValue == 0.0 {
+          panel?.orderOut(nil)
+        }
+      })
+  }
+
+  // MARK: - Modern Native Settings Window
+
+  func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool
+  {
+    showSettings()
+    return true
+  }
+
+  private func makeCard(height: CGFloat) -> NSBox {
+    let box = NSBox(frame: NSRect(x: 0, y: 0, width: 420, height: height))
+    box.boxType = .custom
+    box.cornerRadius = 12
+    box.borderWidth = 1
+    box.borderColor = NSColor.separatorColor.withAlphaComponent(0.45)
+    box.fillColor = NSColor.controlBackgroundColor
+    box.contentViewMargins = .zero
+    return box
+  }
+
+  private func addDivider(to parent: NSView, y: CGFloat) {
+    let line = NSBox(frame: NSRect(x: 16, y: y, width: 388, height: 1))
+    line.boxType = .separator
+    parent.addSubview(line)
+  }
+
+  @objc func showSettings() {
+    if settingsWindow == nil {
+      let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 468, height: 446),
+        styleMask: [.titled, .closable], backing: .buffered, defer: false)
+      window.title = "OpenTyless 设置"
+      window.isReleasedWhenClosed = false
+      let root = NSView(frame: NSRect(x: 0, y: 0, width: 468, height: 446))
+      window.contentView = root
+
+      // Header
+      let badge = NSView(frame: NSRect(x: 24, y: 384, width: 40, height: 40))
+      badge.wantsLayer = true
+      badge.layer?.cornerRadius = 10
+      badge.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.14).cgColor
+      let badgeIcon = NSImageView(frame: NSRect(x: 9, y: 9, width: 22, height: 22))
+      badgeIcon.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "OpenTyless")
+      badgeIcon.contentTintColor = .controlAccentColor
+      badge.addSubview(badgeIcon)
+      root.addSubview(badge)
+
+      let titleLabel = NSTextField(labelWithString: "OpenTyless")
+      titleLabel.font = .systemFont(ofSize: 17, weight: .semibold)
+      titleLabel.frame = NSRect(x: 74, y: 403, width: 160, height: 22)
+      root.addSubview(titleLabel)
+
+      let dot = NSView(frame: NSRect(x: 76, y: 388, width: 8, height: 8))
+      dot.wantsLayer = true
+      dot.layer?.cornerRadius = 4
+      root.addSubview(dot)
+      headerStatusDot = dot
+
+      let subStatus = NSTextField(labelWithString: "")
+      subStatus.font = .systemFont(ofSize: 12)
+      subStatus.textColor = .secondaryLabelColor
+      subStatus.frame = NSRect(x: 90, y: 383, width: 350, height: 17)
+      root.addSubview(subStatus)
+      headerStatusLabel = subStatus
+
+      // Card 1: Shortcuts & Input
+      let inputTitle = NSTextField(labelWithString: "触发与输入")
+      inputTitle.font = .systemFont(ofSize: 12, weight: .semibold)
+      inputTitle.textColor = .secondaryLabelColor
+      inputTitle.frame = NSRect(x: 28, y: 352, width: 120, height: 16)
+      root.addSubview(inputTitle)
+
+      let inputCard = makeCard(height: 148)
+      inputCard.frame = NSRect(x: 24, y: 198, width: 420, height: 148)
+      root.addSubview(inputCard)
+      let ic = inputCard.contentView!
+
+      let hkLabel = NSTextField(labelWithString: "语音快捷键")
+      hkLabel.font = .systemFont(ofSize: 13, weight: .medium)
+      hkLabel.frame = NSRect(x: 16, y: 112, width: 140, height: 20)
+      ic.addSubview(hkLabel)
+
+      let popup = NSPopUpButton(frame: NSRect(x: 274, y: 108, width: 130, height: 26), pullsDown: false)
+      for choice in hotkeys { popup.addItem(withTitle: choice.name) }
+      popup.target = self
+      popup.action = #selector(hotkeyPopupChanged(_:))
+      ic.addSubview(popup)
+      hotkeyPopup = popup
+      addDivider(to: ic, y: 98)
+
+      let msLabel = NSTextField(labelWithString: "鼠标侧键快捷操控")
+      msLabel.font = .systemFont(ofSize: 13, weight: .medium)
+      msLabel.frame = NSRect(x: 16, y: 69, width: 200, height: 19)
+      ic.addSubview(msLabel)
+      let msSub = NSTextField(labelWithString: "上侧键录音/转写 · 下侧键短按粘贴、长按 0.5s 发送")
+      msSub.font = .systemFont(ofSize: 11)
+      msSub.textColor = .secondaryLabelColor
+      msSub.frame = NSRect(x: 16, y: 51, width: 280, height: 15)
+      ic.addSubview(msSub)
+      let msSwitch = NSSwitch(frame: NSRect(x: 364, y: 58, width: 40, height: 24))
+      msSwitch.target = self
+      msSwitch.action = #selector(toggleMouseShortcuts)
+      ic.addSubview(msSwitch)
+      mouseEnableSwitch = msSwitch
+      addDivider(to: ic, y: 44)
+
+      let swLabel = NSTextField(labelWithString: "反转鼠标上下侧键")
+      swLabel.font = .systemFont(ofSize: 13, weight: .medium)
+      swLabel.frame = NSRect(x: 16, y: 13, width: 200, height: 19)
+      ic.addSubview(swLabel)
+      let swSwitch = NSSwitch(frame: NSRect(x: 364, y: 10, width: 40, height: 24))
+      swSwitch.target = self
+      swSwitch.action = #selector(swapMouseButtons)
+      ic.addSubview(swSwitch)
+      mouseSwapSwitch = swSwitch
+
+      // Card 2: System & Permissions
+      let sysTitle = NSTextField(labelWithString: "权限与系统")
+      sysTitle.font = .systemFont(ofSize: 12, weight: .semibold)
+      sysTitle.textColor = .secondaryLabelColor
+      sysTitle.frame = NSRect(x: 28, y: 172, width: 120, height: 16)
+      root.addSubview(sysTitle)
+
+      let sysCard = makeCard(height: 114)
+      sysCard.frame = NSRect(x: 24, y: 52, width: 420, height: 114)
+      root.addSubview(sysCard)
+      let sc = sysCard.contentView!
+
+      let micTitle = NSTextField(labelWithString: "麦克风权限")
+      micTitle.font = .systemFont(ofSize: 13, weight: .medium)
+      micTitle.frame = NSRect(x: 16, y: 83, width: 140, height: 19)
+      sc.addSubview(micTitle)
+      let micStat = NSTextField(labelWithString: "")
+      micStat.font = .systemFont(ofSize: 12, weight: .medium)
+      micStat.alignment = .right
+      micStat.frame = NSRect(x: 260, y: 84, width: 144, height: 17)
+      sc.addSubview(micStat)
+      micStatusLabel = micStat
+      let micBtn = NSButton(title: "授权…", target: self, action: #selector(microphone))
+      micBtn.bezelStyle = .rounded
+      micBtn.controlSize = .small
+      micBtn.frame = NSRect(x: 334, y: 80, width: 72, height: 24)
+      sc.addSubview(micBtn)
+      micActionButton = micBtn
+      addDivider(to: sc, y: 74)
+
+      let axTitle = NSTextField(labelWithString: "辅助功能权限")
+      axTitle.font = .systemFont(ofSize: 13, weight: .medium)
+      axTitle.frame = NSRect(x: 16, y: 46, width: 160, height: 19)
+      sc.addSubview(axTitle)
+      let axStat = NSTextField(labelWithString: "")
+      axStat.font = .systemFont(ofSize: 12, weight: .medium)
+      axStat.alignment = .right
+      axStat.frame = NSRect(x: 260, y: 47, width: 144, height: 17)
+      sc.addSubview(axStat)
+      axStatusLabel = axStat
+      let axBtn = NSButton(title: "去开启…", target: self, action: #selector(mousePermission))
+      axBtn.bezelStyle = .rounded
+      axBtn.controlSize = .small
+      axBtn.frame = NSRect(x: 334, y: 43, width: 72, height: 24)
+      sc.addSubview(axBtn)
+      axActionButton = axBtn
+      addDivider(to: sc, y: 37)
+
+      let lgTitle = NSTextField(labelWithString: "登录时自动启动")
+      lgTitle.font = .systemFont(ofSize: 13, weight: .medium)
+      lgTitle.frame = NSRect(x: 16, y: 9, width: 180, height: 19)
+      sc.addSubview(lgTitle)
+      let lgSwitch = NSSwitch(frame: NSRect(x: 364, y: 6, width: 40, height: 24))
+      lgSwitch.target = self
+      lgSwitch.action = #selector(toggleLogin)
+      sc.addSubview(lgSwitch)
+      loginSwitch = lgSwitch
+
+      // Footer
+      let modelLbl = NSTextField(labelWithString: "")
+      modelLbl.font = .systemFont(ofSize: 11)
+      modelLbl.textColor = .tertiaryLabelColor
+      modelLbl.frame = NSRect(x: 26, y: 18, width: 256, height: 16)
+      root.addSubview(modelLbl)
+      modelSummaryLabel = modelLbl
+
+      let cfgBtn = NSButton(title: "编辑配置…", target: self, action: #selector(openConfig))
+      cfgBtn.bezelStyle = .rounded
+      cfgBtn.controlSize = .small
+      cfgBtn.frame = NSRect(x: 288, y: 14, width: 80, height: 24)
+      root.addSubview(cfgBtn)
+
+      let reloadBtn = NSButton(title: "重载服务", target: self, action: #selector(restart))
+      reloadBtn.bezelStyle = .rounded
+      reloadBtn.controlSize = .small
+      reloadBtn.frame = NSRect(x: 372, y: 14, width: 72, height: 24)
+      root.addSubview(reloadBtn)
+
+      window.center()
+      settingsWindow = window
+    }
+    refresh()
+    NSApp.activate(ignoringOtherApps: true)
+    settingsWindow?.makeKeyAndOrderFront(nil)
+  }
+
+  private func updateSettingsControls(
+    running: Bool, configured: Bool, login: Bool, micAuth: Bool, axTrusted: Bool
+  ) {
+    guard settingsWindow != nil else { return }
+    let dotColor: NSColor =
+      !running ? .systemGray : !configured ? .systemOrange : lastError != nil ? .systemOrange : .systemGreen
+    headerStatusDot?.layer?.backgroundColor = dotColor.cgColor
+    headerStatusLabel?.stringValue =
+      configured ? statusText : "未检测到 API 密钥，请点击右下角「编辑配置…」填写"
+
+    hotkeyPopup?.selectItem(at: selected)
+    mouseEnableSwitch?.state = mouseShortcutsEnabled ? .on : .off
+    mouseSwapSwitch?.state = mouseShortcuts.swapped ? .on : .off
+    mouseSwapSwitch?.isEnabled = mouseShortcutsEnabled
+
+    micStatusLabel?.stringValue = "已授权"
+    micStatusLabel?.textColor = .systemGreen
+    micStatusLabel?.isHidden = !micAuth
+    micActionButton?.isHidden = micAuth
+
+    axStatusLabel?.stringValue = "已授权"
+    axStatusLabel?.textColor = .systemGreen
+    axStatusLabel?.isHidden = !axTrusted
+    axActionButton?.isHidden = axTrusted
+
+    loginSwitch?.state = login ? .on : .off
+    loginSwitch?.isEnabled = !busy && !recording && !transcribing
+    modelSummaryLabel?.stringValue = activeModelSummary
+  }
+
+  @objc func hotkeyPopupChanged(_ sender: NSPopUpButton) {
+    let idx = sender.indexOfSelectedItem
+    guard idx >= 0 && idx < hotkeys.count else { return }
+    registerHotkey(idx)
+    if let hotkeyError {
+      alert("快捷键冲突", hotkeyError)
+    }
+    renderedState = ""
+    refresh()
+  }
+
+  // MARK: - Actions & Result Window
+
   func updateMouseShortcuts() {
     guard mouseShortcutsEnabled && AXIsProcessTrusted() else {
       mouseShortcuts.stop()
@@ -364,19 +1060,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       return
     }
     if !mouseShortcuts.isRunning {
-      mouseShortcutError = mouseShortcuts.start() ? nil : "监听失败，请检查辅助功能权限"
+      mouseShortcutError = mouseShortcuts.start() ? nil : "侧键监听未就绪"
     }
   }
+
   @objc func toggleMouseShortcuts() {
     preferences.set(!mouseShortcutsEnabled, forKey: "mouseShortcutsEnabled")
+    renderedState = ""
     refresh()
     if mouseShortcutsEnabled && !AXIsProcessTrusted() { mousePermission() }
   }
+
   @objc func swapMouseButtons() {
     mouseShortcuts.swapped.toggle()
     preferences.set(mouseShortcuts.swapped, forKey: "mouseButtonsSwapped")
+    renderedState = ""
     refresh()
   }
+
   @objc func mousePermission() {
     let options =
       [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
@@ -384,15 +1085,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     NSWorkspace.shared.open(
       URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
   }
+
   func pasteClipboard() {
     guard AXIsProcessTrusted() else {
       mousePermission()
       return
     }
-    // Paste the existing clipboard into the focused application, exactly as ⌘V.
-    // Do not activate OpenTyless or replace the clipboard with an older result.
     for event in MouseShortcuts.pasteEvents() { event.post(tap: .cgSessionEventTap) }
   }
+
   func alert(_ title: String, _ body: String) {
     NSApp.activate(ignoringOtherApps: true)
     let alert = NSAlert()
@@ -400,6 +1101,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     alert.informativeText = body
     alert.runModal()
   }
+
   func perform(_ args: [String], completion: (() -> Void)? = nil) {
     guard !busy else { return }
     busy = true
@@ -412,158 +1114,82 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       }
     }
   }
+
   @objc func toggle() {
     guard !busy && !transcribing else { return }
     if recording {
       perform(["toggle-record"])
       return
     }
+    startRecording()
+  }
+
+  @objc func changeHotkeyFromMenu(_ sender: NSMenuItem) {
+    let idx = sender.tag
+    guard idx >= 0 && idx < hotkeys.count else { return }
+    if idx != selected || hotkey == nil { registerHotkey(idx) }
+    if let hotkeyError { alert("快捷键冲突", hotkeyError) }
+    renderedState = ""
+    refresh()
+  }
+
+  @objc func startRecording() {
+    guard !busy && !recording && !transcribing else { return }
+    startWithMicrophone("start-record")
+  }
+
+  @objc func stopAndTranscribe() { perform(["stop-record"]) }
+
+  @objc func saveRecording() { perform(["save-record"]) }
+
+  func startWithMicrophone(_ command: String) {
+    if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
+      perform([command])
+      return
+    }
     busy = true
-    DispatchQueue.global(qos: .userInitiated).async {
-      let result = runCLI(["check-config"])
+    AVCaptureDevice.requestAccess(for: .audio) { allowed in
       DispatchQueue.main.async {
         self.busy = false
-        guard result.0 == 0 else {
-          self.alert(
-            "请先配置 API Key", "在状态栏的「编辑 API 配置」中填写 DASHSCOPE_API_KEY，然后选择「重新加载配置」。\n\n" + result.1)
-          return
-        }
-        if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
-          self.perform(["toggle-record"])
-          return
-        }
-        self.busy = true
-        AVCaptureDevice.requestAccess(for: .audio) { allowed in
-          DispatchQueue.main.async {
-            self.busy = false
-            if allowed {
-              self.perform(["toggle-record"])
-            } else {
-              self.alert("需要麦克风权限", "请在系统设置 → 隐私与安全性 → 麦克风中允许 OpenTyless。")
-            }
-          }
-        }
+        if allowed { self.perform([command]) }
+        else { self.alert("需要麦克风权限", "请在系统设置 → 隐私与安全性 → 麦克风中允许 OpenTyless。") }
+        self.renderedState = ""
+        self.refresh()
       }
     }
   }
-  func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool
-  {
-    showSettings()
-    return true
-  }
-  @objc func showSettings() {
-    if settingsWindow == nil {
-      let window = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: 540, height: 340), styleMask: [.titled, .closable],
-        backing: .buffered, defer: false)
-      window.title = "OpenTyless · 设置与状态"
-      window.isReleasedWhenClosed = false
-      let label = NSTextField(wrappingLabelWithString: "")
-      label.frame = NSRect(x: 24, y: 80, width: 492, height: 235)
-      label.font = NSFont.systemFont(ofSize: 14)
-      window.contentView?.addSubview(label)
-      settingsLabel = label
-      let config = NSButton(title: "编辑 API 配置", target: self, action: #selector(openConfig))
-      config.frame = NSRect(x: 24, y: 24, width: 110, height: 32)
-      config.bezelStyle = .rounded
-      window.contentView?.addSubview(config)
-      let permission = NSButton(title: "麦克风权限", target: self, action: #selector(microphone))
-      permission.frame = NSRect(x: 150, y: 24, width: 110, height: 32)
-      permission.bezelStyle = .rounded
-      window.contentView?.addSubview(permission)
-      let mouse = NSButton(title: "鼠标侧键权限", target: self, action: #selector(mousePermission))
-      mouse.frame = NSRect(x: 276, y: 24, width: 110, height: 32)
-      mouse.bezelStyle = .rounded
-      window.contentView?.addSubview(mouse)
-      let status = NSButton(title: "状态栏菜单", target: self, action: #selector(showMenu))
-      status.frame = NSRect(x: 402, y: 24, width: 110, height: 32)
-      status.bezelStyle = .rounded
-      window.contentView?.addSubview(status)
-      window.center()
-      settingsWindow = window
-    }
-    refresh()
-    NSApp.activate(ignoringOtherApps: true)
-    settingsWindow?.makeKeyAndOrderFront(nil)
-  }
-  @objc func showMenu() {
-    buildMenu()
-    if let button = item.button, let menu = item.menu {
-      menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height), in: button)
-    }
-  }
+
   @objc func copyLast() {
-    perform(["copy-last"]) { self.showHUD("复制成功", "按鼠标下侧键或 ⌘V 粘贴", symbol: "doc.on.clipboard") }
+    perform(["copy-last"]) { self.showPill(.success("已复制"), duration: 1.2) }
   }
+
   @objc func cancel() {
-    // Cancel is exposed by the daemon socket; keep the same public CLI on both platforms.
     perform(["cancel-record"])
   }
-  func showHUD(_ title: String, _ detail: String, symbol: String, persistent: Bool = false) {
-    hudHide?.cancel()
-    hud?.orderOut(nil)
-    let panel = NSPanel(
-      contentRect: NSRect(x: 0, y: 0, width: 360, height: 88),
-      styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-    panel.title = "OpenTyless · 状态提示"
-    panel.isOpaque = false
-    panel.backgroundColor = .clear
-    panel.hasShadow = true
-    panel.level = .floating
-    panel.ignoresMouseEvents = true
-    panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
-    let effect = NSVisualEffectView(frame: panel.contentView!.bounds)
-    effect.material = .hudWindow
-    effect.blendingMode = .behindWindow
-    effect.state = .active
-    effect.wantsLayer = true
-    effect.layer?.cornerRadius = 16
-    effect.layer?.masksToBounds = true
-    panel.contentView = effect
-    let icon = NSImageView(frame: NSRect(x: 20, y: 26, width: 30, height: 30))
-    icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
-    icon.contentTintColor = .controlAccentColor
-    effect.addSubview(icon)
-    let heading = NSTextField(labelWithString: title)
-    heading.font = .systemFont(ofSize: 15, weight: .semibold)
-    heading.frame = NSRect(x: 64, y: 47, width: 280, height: 21)
-    effect.addSubview(heading)
-    let subtitle = NSTextField(labelWithString: detail)
-    subtitle.font = .systemFont(ofSize: 12)
-    subtitle.textColor = .secondaryLabelColor
-    subtitle.frame = NSRect(x: 64, y: 22, width: 280, height: 20)
-    effect.addSubview(subtitle)
-    let screen =
-      NSScreen.screens.first(where: { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) })
-      ?? NSScreen.main
-    if let screen {
-      panel.setFrameOrigin(
-        NSPoint(x: screen.visibleFrame.midX - 180, y: screen.visibleFrame.maxY - 110))
-    }
-    panel.orderFrontRegardless()
-    hud = panel
-    if !persistent {
-      let work = DispatchWorkItem { [weak panel] in panel?.orderOut(nil) }
-      hudHide = work
-      DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: work)
-    }
-  }
+
   @objc func showResult() {
     if resultWindow == nil {
       let window = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: 560, height: 360),
+        contentRect: NSRect(x: 0, y: 0, width: 520, height: 340),
         styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
-      window.title = "OpenTyless · 最近结果"
+      window.title = "最近结果"
       window.isReleasedWhenClosed = false
-      window.minSize = NSSize(width: 400, height: 260)
-      let scroll = NSScrollView(frame: NSRect(x: 20, y: 68, width: 520, height: 272))
+      window.minSize = NSSize(width: 380, height: 240)
+
+      let scroll = NSScrollView(frame: NSRect(x: 20, y: 64, width: 480, height: 256))
       scroll.hasVerticalScroller = true
+      scroll.drawsBackground = true
+      scroll.wantsLayer = true
+      scroll.layer?.cornerRadius = 8
+      scroll.layer?.borderWidth = 1
+      scroll.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.5).cgColor
       scroll.autoresizingMask = [.width, .height]
+
       let text = NSTextView(frame: scroll.bounds)
       text.isEditable = false
       text.isSelectable = true
       text.isRichText = false
-      text.font = .systemFont(ofSize: 15)
+      text.font = .systemFont(ofSize: 14)
       text.textContainerInset = NSSize(width: 12, height: 12)
       text.isVerticallyResizable = true
       text.autoresizingMask = [.width]
@@ -571,10 +1197,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       scroll.documentView = text
       window.contentView?.addSubview(scroll)
       resultText = text
-      let copy = NSButton(title: "复制这段文字", target: self, action: #selector(copyPreview))
-      copy.frame = NSRect(x: 20, y: 20, width: 140, height: 32)
+
+      let copy = NSButton(title: "复制全文", target: self, action: #selector(copyPreview))
+      copy.frame = NSRect(x: 400, y: 18, width: 100, height: 30)
       copy.bezelStyle = .rounded
+      copy.keyEquivalent = "\r"
+      copy.autoresizingMask = [.minXMargin, .maxYMargin]
       window.contentView?.addSubview(copy)
+
       window.center()
       resultWindow = window
     }
@@ -582,23 +1212,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     NSApp.activate(ignoringOtherApps: true)
     resultWindow?.makeKeyAndOrderFront(nil)
   }
+
   @objc func copyPreview() {
     NSPasteboard.general.clearContents()
     NSPasteboard.general.setString(resultText?.string ?? "", forType: .string)
-    showHUD("复制成功", "按 ⌘V 粘贴这段文字", symbol: "doc.on.clipboard")
+    showPill(.success("已复制"), duration: 1.2)
   }
-  @objc func restart() { perform(["restart"]) }
-  @objc func showStatus() {
-    showHUD(
-      "OpenTyless · " + statusText, "快捷键：" + hotkeys[selected].name,
-      symbol: recording ? "mic.fill" : "mic")
+
+  @objc func restart() {
+    envStore.invalidate()
+    perform(["restart"]) { self.showPill(.success("服务已重载"), duration: 1.2) }
   }
-  @objc func showError() { alert("后台错误", lastError ?? "无错误") }
-  @objc func changeHotkey(_ sender: NSMenuItem) {
-    if sender.tag != selected || hotkey == nil { registerHotkey(sender.tag) }
-    if let hotkeyError { alert("快捷键冲突", hotkeyError) }
-    buildMenu()
-  }
+
+  @objc func showError() { alert("错误详情", lastError ?? "无错误") }
+
   @objc func openConfig() {
     let url = configDir.appendingPathComponent(".env")
     if let editor = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.TextEdit")
@@ -609,28 +1236,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       NSWorkspace.shared.open(url)
     }
   }
+
   @objc func openOutputs() {
     let url = outputURL()
     try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
     NSWorkspace.shared.open(url)
   }
+
   @objc func openLogs() {
     NSWorkspace.shared.open(home.appendingPathComponent("Library/Logs/opentyless"))
   }
+
   @objc func microphone() {
     AVCaptureDevice.requestAccess(for: .audio) { allowed in
       DispatchQueue.main.async {
-        self.alert("麦克风权限", allowed ? "已授权。" : "未授权，请在系统设置 → 隐私与安全性 → 麦克风中允许 OpenTyless。")
+        self.renderedState = ""
+        self.refresh()
+        if !allowed {
+          NSWorkspace.shared.open(
+            URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!)
+        }
       }
     }
   }
+
   @objc func toggleLogin() {
     guard !busy else { return }
     let enabled = loginEnabled
     busy = true
     DispatchQueue.global(qos: .userInitiated).async {
-      // Remove the tray plist directly: booting out our own launchd job
-      // here would kill the menu before the operation completes.
       var result: (Int32, String) = (0, "")
       if enabled {
         do {
@@ -648,16 +1282,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         self.busy = false
         if result.0 != 0 {
           self.alert("自启动设置失败", result.1)
-        } else if enabled {
-          // Disabling login startup should leave the current session usable.
-          self.alert("已关闭登录自启动", "下次登录不会自动运行。当前会话仍可正常使用。")
         }
+        self.renderedState = ""
         self.refresh()
       }
     }
   }
+
   @objc func quit() { perform(["stop"]) { NSApp.terminate(nil) } }
+
   func applicationWillTerminate(_ notification: Notification) {
+    stopRecordingClock()
+    permissionTimer?.invalidate()
+    daemonExitWatcher?.cancel()
+    for watcher in dirWatchers { watcher.cancel() }
     mouseShortcuts.stop()
     if let hotkey { UnregisterEventHotKey(hotkey) }
     if let handler { RemoveEventHandler(handler) }
